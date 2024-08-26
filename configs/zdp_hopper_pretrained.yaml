@@ -1,0 +1,139 @@
+defaults:
+  - _self_
+
+seed: 40
+batch_size: 90
+num_threads: 30
+num_epochs: 1000
+t_expansion: 1
+#logger parameters
+experiment_name: "hopper-zd-surface"
+pretrained_net: "wdc3iii/zero_dynamics_policies/nm2qio2n"
+
+lr: 5e-4
+
+lr_scheduler:
+  _target_: 'optax.piecewise_constant_schedule'
+  init_value: ${lr}
+  boundaries_and_scales: {
+                           1000: 0.5,
+                           1200: 0.5,
+                           1300: 0.5,
+                           1400: 0.5,
+                           1500: 0.5,
+  }
+
+aux_logger:
+  z:
+    _target_: "utils.no_summary"
+    _partial_: true
+  u:
+    _target_: "utils.no_summary"
+    _partial_: true
+  eta:
+    _target_: "utils.no_summary"
+    _partial_: true
+  z_p:
+    _target_: "utils.no_summary"
+    _partial_: true
+  eta_p:
+    _target_: "utils.no_summary"
+    _partial_: true
+  psi_zp:
+    _target_: "utils.no_summary"
+    _partial_: true
+  all:
+    _target_: "utils.hopper_zd_value_summary"
+    _partial_: true
+
+
+grad_clipper:
+  _target_: 'optax.clip_by_global_norm'
+  max_norm: 1.0
+
+optimizer:
+  _target_: 'optax.adamw'
+  weight_decay: 0 # 1e-5
+
+dataset:
+  _target_: 'datasets.UniformRandomDataset'
+  _partial_: true
+  lower_bound:
+    _target_: 'numpy.array'
+    object: [-1.5, -1.5, -0.75, -0.75]
+  upper_bound:
+    _target_: 'numpy.array'
+    object: [1.5, 1.5, 0.75, 0.75]
+  length: 1000000
+
+u_max: 0.1
+p_max: 0.5
+loss:
+  _target_: 'losses.discrete_invariance_loss'
+  _partial_: true
+  integrator:
+    _target_: 'simulator.DiscreteInvarianceIntegrator'
+    _partial_: true
+    dyn:
+      _target_: 'robots.HopperH2H'
+      integrator:
+        _target_: 'diffrax.diffeqsolve'
+        _partial_: true
+        solver:
+          _target_: 'diffrax.Tsit5'
+        stepsize_controller:
+          _target_: 'diffrax.ConstantStepSize'
+        dt0: 0.0001
+        discrete_terminating_event:
+          _target_: 'diffrax.DiscreteTerminatingEvent'
+          cond_fn:
+            _target_: 'robots.HopperH2H.ode_gf_event'
+            _partial_: true
+    control_policy:
+      _target_: 'control.DDPPolicy'
+      A_in:
+        _target_: 'control.DDPPolicy.get_A_in'
+      b_in:
+        _target_: 'control.DDPPolicy.get_b_in'
+        u_max: ${u_max}
+      ddp_func:
+        _target_: 'ddp.ddp_from_nz0_func'
+        torque_bounds: False
+        N: 25
+        ddp_iter: 4
+        dyn: ${loss.integrator.dyn}
+        u_max: ${u_max}
+        raibert_heuristic:
+          _target_: 'control.raibert_policy'
+          K:
+            _target_: 'numpy.array'
+            object: [[1.9010, 0, 0, 0, 0.1550, 0, 0, 0.5686, 0, 0],
+                     [0, 1.9010, 0, 0, 0, 0.1550, 0, 0, 0.5686, 0]]
+          state_bound:
+            _target_: 'utils.InputBounds'
+            lower:
+              _target_: 'control.RaibertPolicy.get_state_lower_bound'
+              p_max: ${p_max}
+            upper:
+              _target_: 'control.RaibertPolicy.get_state_upper_bound'
+              p_max: ${p_max}
+          action_bound:
+            _target_: 'utils.InputBounds'
+            lower:
+              _target_: 'control.DDPPolicy.get_action_lower_bound'
+              u_max: ${u_max}
+            upper:
+              _target_: 'control.DDPPolicy.get_action_upper_bound'
+              u_max: ${u_max}
+psi_policy:
+  _target_: 'control.HopperZDynPolicy'
+  _partial_: true
+  dyn: ${loss.integrator.dyn}
+  output_bounds:
+    _target_: 'utils.InputBounds'
+    lower:
+      _target_: 'control.DDPPolicy.get_action_lower_bound'
+      u_max: ${u_max}
+    upper:
+      _target_: 'control.DDPPolicy.get_action_upper_bound'
+      u_max: ${u_max}

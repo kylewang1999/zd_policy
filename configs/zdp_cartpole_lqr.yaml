@@ -1,0 +1,128 @@
+defaults:
+  - _self_
+
+seed: 42
+batch_size: 128
+num_epochs: 1000
+
+#logger parameters
+experiment_name: "zdp-cartpole-lqr"
+
+lr: 1e-2
+
+lr_scheduler:
+  _target_: 'optax.piecewise_constant_schedule'
+  init_value: ${lr}
+  boundaries_and_scales: {
+                           2000: 0.2,
+                           4000: 0.2,
+                           6000: 0.5,
+                           8000: 0.5,
+                           10000: 0.5,
+  }
+
+aux_logger:
+  dphidz_zstardot:
+    _target_: "utils.no_summary"
+    _partial_: true
+  eta_star_dot:
+    _target_: "utils.no_summary"
+    _partial_: true
+  z:
+    _target_: "utils.no_summary"
+    _partial_: true
+  nd:
+    _target_: "utils.no_summary"
+    _partial_: true
+  all:
+    _target_: "utils.cartpole_tangent_invariance_summary"
+    _partial_: true
+
+
+grad_clipper:
+  _target_: 'optax.clip_by_global_norm'
+  max_norm: 1.0
+
+optimizer:
+  _target_: 'optax.adamw'
+  weight_decay: 1e-5
+
+dataset:
+  _target_: 'datasets.UniformRandomDataset'
+  _partial_: true
+  lower_bound:
+    _target_: 'numpy.array'
+    object: [-1.5, -10]
+  upper_bound:
+    _target_: 'numpy.array'
+    object: [1.5, 10]
+  length: 1000000
+
+eval_integrator:
+  _target_: 'simulator.adaptive_integrator_factory'
+  _partial_: true
+  diffeqsolver:
+    _target_: 'diffrax.diffeqsolve'
+    _partial_: true
+    solver:
+      _target_: 'diffrax.Tsit5'
+    stepsize_controller:
+      _target_: 'diffrax.PIDController'
+      rtol: 1e-3
+      atol: 1e-6
+      dtmin: 1e-5
+    max_steps: 2000
+  ts:
+    _target_: 'jax.numpy.linspace'
+    start: 0.0
+    stop: 3.0
+    num: 30
+
+loss:
+  _target_: 'losses.invariance_loss'
+  integrator:
+    _target_: 'simulator.TangentSpaceMinClosedLoopIntegrator'
+    dyn:
+#      _target_: 'robots.Cartpole'
+      _target_: 'robots.UnstableBaseCartpole' # Unstable Pole
+#      _target_: 'robots.UnstableCartpole' # Unstable Pole
+      gamma: 1.0
+    control_policy:
+      _target_: 'control.NZLinearController'
+      Kn:
+        _target_: 'numpy.array'
+        object: [[-10, 18.348]]
+        dtype: 'float64'
+      Kz:
+        _target_: 'numpy.array'
+        object: [[-128.3241, -38.8813]]
+        dtype: 'float64'
+
+    psi_policy:
+      _target_: 'control.RelaxedZDynPolicy'
+      dyn: ${loss.integrator.dyn}
+      mlp:
+        _target_: 'control.ZeroInvariantFunction'
+        mlp:
+          _target_: 'control.MLP'
+          n_hidden: 256
+          n_outputs: 2
+          n_layers: 2
+          activation:
+            _target_: 'flax.linen.relu'
+            _partial_: true
+      angle_rep:
+        _target_: 'control.AngleRepresentation'
+        angle_mask:
+          _target_: 'numpy.array'
+          object: [ 0, 0 ]
+          dtype: 'bool'
+      output_bounds: null
+      K:
+        _target_: 'numpy.array'
+        object: [ 20.0, 12.6 ] # 2 * sqrt(10
+        dtype: 'float64'
+
+
+
+

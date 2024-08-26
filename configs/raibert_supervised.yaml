@@ -1,0 +1,122 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+seed: 42
+#batch_size: 16384
+#batch_size: 8192
+batch_size: 1024
+#batch_size: 128
+num_epochs: 1000
+
+#logger parameters
+experiment_name: "raibert_supervised_policy_hopper"
+
+lr: 5e-4
+
+lr_scheduler:
+  _target_: 'optax.piecewise_constant_schedule'
+  init_value: ${lr}
+  boundaries_and_scales: {
+                           100: 0.5,
+                           200: 0.5,
+                           300: 0.5,
+                           400: 0.5,
+  }
+aux_logger:
+  eta_d:
+    _target_: "utils.no_summary"
+    _partial_: true
+  eta_true:
+    _target_: "utils.no_summary"
+    _partial_: true
+
+grad_clipper:
+  _target_: 'optax.clip_by_global_norm'
+  max_norm: 1.0
+
+optimizer:
+  _target_: 'optax.adamw'
+  weight_decay: 1e-8
+
+dataset:
+  _target_: 'datasets.SupervisedRaibertSampler'
+  _partial_: true
+  length: 5000
+  K:
+    _target_: 'numpy.array'
+    object: [[1.9010, 0, 0.1550, 0, 0.5686, 0],
+             [0, 1.9010, 0, 0.1550, 0, 0.5686]]
+#    object: [ [ 2.1059, 0, 0.0505, 0, 0.6895, 0 ],
+#              [ 0, 2.1059, 0, 0.0505, 0, 0.6895 ] ]
+    dtype: 'float64'
+  hopper:
+    _target_: 'robots.HopperH2H'
+    integrator:
+      _target_: 'diffrax.diffeqsolve'
+      _partial_: true
+      solver:
+        _target_: 'diffrax.Tsit5'
+      stepsize_controller:
+        _target_: 'diffrax.ConstantStepSize'
+      dt0: 0.0001
+      discrete_terminating_event:
+        _target_: 'diffrax.DiscreteTerminatingEvent'
+        cond_fn:
+          _target_: 'robots.HopperH2H.ode_gf_event'
+          _partial_: true
+  state_bound:
+    _target_: 'control.InputBounds'
+    lower:
+      _target_: 'numpy.array'
+      object: [-0.1, -0.1, -1, -1, -0.1, -0.1]
+      dtype: 'float64'
+    upper:
+      _target_: 'numpy.array'
+      object: [0.1, 0.1, 1, 1, 0.1, 0.1]
+      dtype: 'float64'
+  pos_bound:
+    _target_: 'control.InputBounds'
+    lower:
+      _target_: 'numpy.array'
+#      object: [-1e9, -1e9, -0.5, -0.5, -1e9, -1e9]
+      object: [-1e9, -1e9, -1e9, -1e9, -1e9, -1e9]
+      dtype: 'float64'
+    upper:
+      _target_: 'numpy.array'
+#      object: [1e9, 1e9, 0.5, 0.5, 1e9, 1e9]
+      object: [1e9, 1e9, 1e9, 1e9, 1e9, 1e9]
+      dtype: 'float64'
+  action_bound:
+    _target_: 'control.InputBounds'
+    lower:
+      _target_: 'numpy.array'
+#      object: [ -0.1, -0.1 ]
+      object: [ -1., -1. ]
+      dtype: 'float64'
+    upper:
+      _target_: 'numpy.array'
+#      object: [ 0.1, 0.1 ]
+      object: [ 1., 1. ]
+      dtype: 'float64'
+
+loss:
+  _target_: 'losses.supervised_loss'
+  integrator:
+    _target_: 'simulator.SupervisedLossIntegrator'
+    mlp:
+      _target_: 'control.ZeroInvariantFunction'
+      mlp:
+        _target_: 'control.MLP'
+        n_hidden: 256
+        n_outputs: 2
+        n_layers: 2
+        activation:
+          _target_: 'flax.linen.relu'
+          _partial_: true
