@@ -1,0 +1,5 @@
+base_config: zdp_cartpole_lqr.yaml
+
+overrides:
+    batch_size: 256
+    num_epochs: 10

@@ -83,9 +83,7 @@ loss:
   integrator:
     _target_: 'simulator.TangentSpaceMinClosedLoopIntegrator'
     dyn:
-#      _target_: 'robots.Cartpole'
-      _target_: 'robots.UnstableBaseCartpole' # Unstable Pole
-#      _target_: 'robots.UnstableCartpole' # Unstable Pole
+      _target_: 'robots.UnstableBaseCartpole'
       gamma: 1.0
     control_policy:
       _target_: 'control.NZLinearController'

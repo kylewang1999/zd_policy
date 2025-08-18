@@ -527,4 +527,13 @@ def tfZeroInvariantMLP(mlp, params: dict, input_size: int, activation, clip=None
 
 
 def hardshrink(x, lambd=0.5):
+    r"""
+    Hard shrink function. (torch doc: https://docs.pytorch.org/docs/stable/generated/torch.nn.Hardshrink.html)
+
+    .. math::
+        \text{hardshrink}(x, \lambda) = \begin{cases}
+            x - \lambda \text{sign}(x) & \text{if } |x| > \lambda \\
+            0 & \text{otherwise}
+        \end{cases}
+    """
     return jnp.where(jnp.abs(x) < lambd, 0, x - jnp.sign(x) * lambd)

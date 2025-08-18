@@ -47,7 +47,32 @@ class AbstractZeroDynamics:
     def nz_split(self, nz):
         return self.nz_n(nz), self.nz_z(nz)
 
+
     def omega(self, t, nz):
+        r"""
+        Zero-dynamics drift :math:`\omega(t,\eta,z)` via the chain rule.
+
+        .. math::
+            \dot{z}(t)
+            = \frac{\partial \phi_z}{\partial x}(t, x)\,\dot{x}(t)
+            = \frac{\partial \phi_z}{\partial x}(t, x)\,f(t, x)
+            + \frac{\partial \phi_z}{\partial x}(t, x)\,g(t, x)\,u(t),
+
+        with :math:`x = \phi^{-1}(t,\eta,z)` and :math:`(\eta,z)=\phi(t,x)`.
+
+        Parameters
+        ----------
+        t : float
+            Time.
+        nz : Array
+            Concatenated state :math:`(\eta,z)`.
+
+        Returns
+        -------
+        Array
+            :math:`\dot z(t)` evaluated at the given state.
+        """
+        
         eta, z = self.nz_split(nz)
         x = self.phi_inv(t, eta, z)
         _, zdot = jax.jvp(lambda w: self.phi_z(t, w),
@@ -317,7 +342,7 @@ class Cartpole(nn.Module, AbstractZeroDynamics):
         gx = self.g(0, x)
         return fx + gx @ u
 
-    def f(self, t, x):
+    def f(self, t, x):      
         x, th, dx, dth = x[0], x[1], x[2], x[3]
         return jnp.stack([
             dx,
@@ -336,6 +361,38 @@ class Cartpole(nn.Module, AbstractZeroDynamics):
         ])
 
     def phi(self, t, state):
+        r"""
+        Actuation decomposition map :math:`\boldsymbol{\phi}: \mathbb{R}^4 \to \mathbb{R}^2 \times \mathbb{R}^2`.
+
+        With state :math:`\mathbf{x}=[x,\ \theta,\ \dot x,\ \dot\theta]^\top`, define
+        the actuated coordinates :math:`\boldsymbol{\eta}` and internal coordinates :math:`\mathbf{z}` by
+        
+        .. math::
+            \boldsymbol{\eta}(\mathbf{x})
+            =
+            \begin{bmatrix} \eta_1 \\ \eta_2 \end{bmatrix}
+            =
+            \begin{bmatrix} x \\ \dot x \end{bmatrix},
+            \quad
+            \mathbf{z}(\mathbf{x})
+            =
+            \begin{bmatrix} z_1 \\ z_2 \end{bmatrix}
+            =
+            \begin{bmatrix}
+                \theta \\
+                m_p\,\ell^2\,\dot\theta \;+\; m_p\,\ell\cos\theta\,\dot x
+            \end{bmatrix}.
+            
+        Here :math:`m_p=\texttt{self.mp}` and :math:`\ell=\texttt{self.l}`.
+
+        .. note::
+        :math:`z_2` equals the generalized momentum conjugate to :math:`\theta` for the point-mass pole:
+        :math:`z_2=\partial L/\partial \dot\theta = m_p\ell^2\dot\theta + m_p\ell\cos\theta\,\dot x`.
+
+        :param t: Time (unused).
+        :param state: State array with entries :math:`[x,\ \theta,\ \dot x,\ \dot\theta]`.
+        :returns: Tuple ``(eta, z)`` as defined above.
+        """
         x, th, dx, dth = state[0], state[1], state[2], state[3]
         eta = jnp.stack([x, dx])
         z = jnp.stack([
@@ -344,6 +401,22 @@ class Cartpole(nn.Module, AbstractZeroDynamics):
         return eta, z
 
     def phi_inv(self, t, eta, z):
+        r"""
+        Inverse map :math:`\boldsymbol{\phi}^{-1}: (\mathbb{R}^2,\mathbb{R}^2)\to\mathbb{R}^4`.
+
+        Given :math:`\boldsymbol{\eta}=[\eta_1,\ \eta_2]^\top` and :math:`\mathbf{z}=[z_1,\ z_2]^\top` from
+        :func:`phi`, recover :math:`\mathbf{x}=[x,\ \theta,\ \dot x,\ \dot\theta]^\top` via
+        
+        .. math::
+        x=\eta_1,\quad \dot x=\eta_2,\quad \theta=z_1,\quad\theta_2=\frac{z_2-m_p \ell \cos \left(z_1\right) \eta_2}{m_p \ell^2}
+        
+        Here :math:`m_p=\texttt{self.mp}` and :math:`\ell=\texttt{self.l}`.
+
+        :param t: Time (unused).
+        :param eta: Array :math:`[\eta_1,\ \eta_2]^\top = [x,\ \dot x]^\top`.
+        :param z: Array :math:`[z_1,\ z_2]^\top = [\theta,\ m_p\ell^2\dot\theta + m_p\ell\cos\theta\,\dot x]^\top`.
+        :returns: State array :math:`[x,\ \theta,\ \dot x,\ \dot\theta]^\top`.
+        """
         eta1_, eta2_ = eta[0], eta[1]
         z1_, z2_ = z[0], z[1]
         return jnp.stack([

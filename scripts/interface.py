@@ -1,3 +1,5 @@
+import sys
+import os.path as osp
 import logging
 from functools import partial
 from pathlib import Path
@@ -15,77 +17,53 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from orbax.checkpoint import PyTreeCheckpointer
 from tqdm import tqdm
-from utils import unnormalize_dict
+
 from jax import numpy as jnp
 from torch.utils.data import DataLoader, BatchSampler, RandomSampler
 
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 import os
-os.environ["WANDB_SILENT"] = "true"
 
-@flax.struct.dataclass
-class State:
-    params: Any
-    opt_state: Any
-    rng: Any
-    step: int
+sys.path.append(osp.dirname(osp.dirname(osp.abspath(__file__))))
+from train import State, CheckPointManager, wandb_model_load
+from utils import unnormalize_dict
 
-    def get_lr(self):
-        return self.opt_state[1].hyperparams["learning_rate"].item()
+CONFIG_DIR = str(Path(__file__).parent.parent / "configs")
 
 
-def wandb_model_load(api, artifact_name):
-    artifact = api.artifact(artifact_name)
-    run = artifact.logged_by()
-    config = run.config
-    config = unnormalize_dict(config)
-    config = OmegaConf.create(config)
-
-    dir = artifact.download(root=Path("/tmp/wandb_downloads"))
-    state = State(**PyTreeCheckpointer().restore(dir))
-
-    return config, state
-
-
-class CheckPointManager:
-    def __init__(self, metric_name="loss"):
-        self.metric_name = metric_name
-        self.best_loss = float("inf")
-        self.ckpt_path = Path(f"/tmp/orbax_checkpoints/{wandb.run.id}")
-        self.orbax_saver = orbax.checkpoint.PyTreeCheckpointer()
-
-    def save(self, state, metric, epoch, step):
-        self._orbax_save(state)
-        artifact = wandb.Artifact(
-            type="model",
-            name=f"{wandb.run.id}_model",
-            metadata={self.metric_name: metric, "epoch": epoch, "step": step},
-        )
-
-        artifact.add_dir(str(self.ckpt_path))
-
-        aliases = ["latest"]
-
-        if self.best_loss > metric:
-            self.best_loss = metric
-            aliases.append("best")
-
-        wandb.run.log_artifact(artifact, aliases=aliases)
-
-    def _orbax_save(self, state):
-        save_args = orbax_utils.save_args_from_target(state)
-        self.orbax_saver.save(str(self.ckpt_path), state, save_args=save_args, force=True)
+def load_config_with_overrides(config_name: str):
+    """
+    Load a config that specifies a base_config and overrides.
+    
+    Args:
+        config_name: Name of the config file (without .yaml extension)
+    
+    Returns:
+        OmegaConf configuration with base config and overrides applied
+    """
+    if not GlobalHydra().is_initialized():
+        initialize_config_dir(config_dir=CONFIG_DIR)
+    
+    override_cfg = compose(config_name=config_name)
+    
+    base_config_name = override_cfg.base_config
+    if base_config_name.endswith('.yaml'):
+        base_config_name = base_config_name[:-5]  # Remove .yaml extension
+    
+    overrides = override_cfg.get('overrides', {})
+    base_cfg = compose(config_name=base_config_name)
+    base_cfg.update(overrides)
+    
+    return base_cfg
 
 
-@hydra.main(
-    config_path=str(Path(__file__).parent / "configs"),
-    config_name="default",
-    version_base="1.2",
-)
-def main(cfg):
+def main(config_name: str = "my_zdp"):
+    
+    cfg = load_config_with_overrides(config_name)
     logging.getLogger('absl').setLevel(logging.ERROR)
     logger = logging.getLogger(__name__)
 
-    # setup rng
     rng = jax.random.PRNGKey(cfg.seed)
     rng, split = jax.random.split(rng)
     dataset = instantiate(cfg.dataset)(rng=split)
@@ -222,21 +200,23 @@ def main(cfg):
             step=state.step,
         )
 
-
-
 if __name__ == "__main__":
-    import os
-
-    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-    os.environ["JAX_ENABLE_X64"] = "true"
-    os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={min(os.cpu_count(), 128)}"
-    from jax import config
-
-    config.update("jax_enable_x64", True)
-    # config.update("jax_debug_nans", True)
-    from jax.experimental.compilation_cache import compilation_cache as cc
-
-    cc.set_cache_dir("/tmp/jax_cache")
-
     main()
+
+
+# # Get absolute path to configs directory
+# config_dir = os.path.join(osp.dirname(osp.dirname(osp.abspath(__file__))), "configs")
+
+# # Initialize Hydra with the config directory
+# with initialize_config_dir(config_dir=config_dir):
+#     # Compose the configuration
+#     cfg = compose(config_name="zdp_cartpole_lqr")
+    
+#     # Call the function directly with the config
+#     # Note: We need to call the actual function, not the decorated version
+#     from train import main
+#     # Get the original function (before decoration)
+#     original_main = main.__wrapped__ if hasattr(main, '__wrapped__') else main
+#     original_main(cfg)
+
+
