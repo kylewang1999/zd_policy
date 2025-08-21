@@ -42,8 +42,76 @@ class LQRDynamics:
 
 
 def linearize_dynamics_function(dyn, dt):
-    """
-    Linearize dynamics about the current state and discretize
+    r"""
+        Linearize a continuous-time system around the current state–input and return its
+        **exact zero-order-hold (ZOH)** discretization as an affine model.
+
+        Overview
+        --------
+        Given dynamics
+
+        .. math::
+
+        \dot{x} = f(x,u), \qquad f:\mathbb{R}^n \times \mathbb{R}^m \to \mathbb{R}^n,
+
+        this routine returns a batched callable producing matrices :math:`(A_k,B_k,C_k)` such that
+
+        .. math::
+
+        x_{k+1} \;=\; A_k\,x_k \;+\; B_k\,u_k \;+\; C_k .
+
+        Linearization
+        -------------
+        Define Jacobians :math:`(A,B)` and the offset :math:`C`:
+
+        .. math::
+
+        A \;\coloneqq\; \left.\frac{\partial f}{\partial x}\right|_{(x,u)} \in \mathbb{R}^{n\times n}, \qquad
+        B \;\coloneqq\; \left.\frac{\partial f}{\partial u}\right|_{(x,u)} \in \mathbb{R}^{n\times m}, \qquad
+        C \;\coloneqq\; f(x,u) - A\,x - B\,u \in \mathbb{R}^{n},
+
+        so that the local affine continuous-time approximation
+
+        .. math::
+
+        \dot{x} \;\approx\; A\,x + B\,u + C
+
+        matches :math:`f` exactly at the expansion point.
+
+        ZOH discretization (sample time :math:`dt`)
+        -------------------------------------------
+        Form the augmented generator
+
+        .. math::
+
+        \tilde{A} \;\coloneqq\;
+        \begin{bmatrix}
+        A & B & C\\
+        0_{m\times n} & 0_{m\times m} & 0_{m\times 1}\\
+        0_{1\times n} & 0_{1\times m} & 0
+        \end{bmatrix},
+        \quad
+        \exp(\tilde{A}\,dt) \;=\;
+        \begin{bmatrix}
+        A_k & B_k & C_k\\
+        0 & I_m & 0\\
+        0 & 0 & 1
+        \end{bmatrix}.
+
+        Equivalently, in integral form,
+
+        .. math::
+
+        A_k = e^{A\,dt}, \quad
+        B_k = \int_{0}^{dt} e^{A\tau}\,B\,d\tau, \quad
+        C_k = \int_{0}^{dt} e^{A\tau}\,C\,d\tau.
+
+        Notes
+        -----
+        - Jacobians :math:`A,B` are computed via forward-mode AD (e.g., ``jax.jacfwd``).
+        - ``vmap`` is used so leading batch dimensions of :math:`(x,u)` are supported; results are per-batch.
+        - This returns an **affine model in absolute coordinates**. For a deviation form, linearize at
+        :math:`(x^\*,u^\*)` and apply to :math:`\delta x=x-x^\*`, :math:`\delta u=u-u^\*`, which removes the offset :math:`C`.
     """
     def linearize(x, u):
         A, B = jax.jacfwd(dyn, argnums=(0, 1))(x, u)
