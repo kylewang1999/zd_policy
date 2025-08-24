@@ -73,6 +73,124 @@ class DoubleIntegratorROM(PyTreeNode):
     
     def lyap(self, z: jnp.array) -> float:
         return 0.5 * self.cfg_rom.kv * (z ** 2)
+    
+    
+    # helpers for loss functions
+    def _encode_vec(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Vector-valued encoder: returns (y,z) concatenated -> shape (2,)."""
+        y, z = self.encode(x)
+        return jnp.hstack([y, z])
+    
+    def _jac_encoder(self, x: jnp.ndarray) -> jnp.ndarray:
+        return jax.jacfwd(self._encode_vec)(x)
+
+    def _jac_y(self, x: jnp.ndarray) -> jnp.ndarray:
+        J = jax.jacfwd(self._encode_vec)(x)  # (2,2)
+        return J[0:1, :]                     # (1,2)
+
+    def _jac_z(self, x: jnp.ndarray) -> jnp.ndarray:
+        J = jax.jacfwd(self._encode_vec)(x)
+        return J[1:2, :]                   
+
+    def _split_f_g(self, y: jnp.ndarray):
+        '''
+        Generic decomposition dyn_y(y,u) = f_y(y) + G_y(y) u via jacobian w.r.t. u.
+        Returns f_y(y):(1,), G_y(y):(1,1).
+        '''
+        u0 = jnp.zeros_like(y)
+        f_y = self.dyn_y(y, u0)
+        G_y = jax.jacfwd(lambda _u: self.dyn_y(y, _u))(u0)
+        return f_y, G_y
+
+    def _sqnorm1(self, a: jnp.ndarray) -> jnp.ndarray:
+        return jnp.sum(a * a, keepdims=True)
+
+
+    # loss functions
+    def loss_y_proj(self, x: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
+        '''
+        L_y = || Dy(x) f_xu - [ f_y(y) + G_y(y) u ] ||^2  (shape (1,))
+        '''
+        y, z = self.encode(x)
+        Dy   = self._jac_y(x)
+        f_xu = self.dyn_x(x, u)
+        term1 = Dy @ f_xu
+        
+        f_y, G_y = self._split_f_g(y)
+        term2 = f_y + (G_y @ jnp.atleast_1d(u))
+        
+        return self._sqnorm1(term1 - term2)
+
+
+    def loss_z_proj(self, x: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
+        '''
+        L_ω = || Dz(x) f_xu - ω(y,z) ||^2  (shape (1,))
+        '''
+        y, z = self.encode(x)
+        Dz   = self._jac_z(x)
+        f_xu = self.dyn_x(x, u)
+        term1 = Dz @ f_xu
+        term2 = self.dyn_z(y, z)
+        return self._sqnorm1(term1 - term2)
+
+
+    def loss_stable_m(
+        self,
+        z: jnp.ndarray,
+    ) -> jnp.ndarray:
+        '''
+        L_{ω,stab}(z) = max{0, <∇V(z), ω(y,z)> + λ V(z)} with ∇V(z)=z, V=0.5||z||^2.
+        Params:
+            z: (1,)
+            lam: float
+        Returns:
+            (1,)
+        '''
+        lam = self.cfg_rom.lamv
+        y = self.policy_psi(z)
+        omega = self.dyn_z(y, z)
+        zTomega = jnp.sum(z * omega, keepdims=True)
+        V = self.lyap(z)
+        stab = zTomega + lam * V
+        return jnp.maximum(0.0, stab)
+
+
+    def loss_invari_m(self, z: jnp.ndarray) -> jnp.ndarray:
+        '''
+        L_inv = || f(ψ(z),z) + G(ψ(z)) v(ψ(z),z) - (∂ψ/∂z)(z) ω(ψ(z),z) ||^2  (shape (1,))
+        Uses per-sample v = policy_v(ψ(z), z), f,G from dyn_y decomposition.
+        '''
+        y = self.policy_psi(z)
+        v = self.policy_v(y, z)
+
+        Jpsi = jax.jacfwd(self.policy_psi)(z)
+        omega = self.dyn_z(y, z)
+
+        term1  = self.dyn_y(y, v)
+        term2 = (Jpsi @ omega)
+        return self._sqnorm1(term1 - term2)
+
+
+    def loss_nondegenerate_enc(
+        self,
+        x: jnp.ndarray,
+        alpha_det: float = 1.0,   # weight for (det-1)^2
+        beta_orth: float = 1.0,   # weight for ||JᵀJ - I||_F^2
+        gamma_pos: float = 0.0    # weight to prefer det>0 (orientation)
+    ) -> jnp.ndarray:
+        '''
+        Encourage J_E(x) ∈ SL(n) approximately: det→1, orthonormal columns, det>0.
+        Returns shape (1,).
+        '''
+        J = self._jac_encoder(x)
+        n = J.shape[0]
+        detJ = jnp.linalg.det(J)
+        I = jnp.eye(n, dtype=J.dtype)
+        
+        term_det = (jnp.abs(detJ) - 1.0) ** 2            # (det-1)^2 close to 0
+        term_orth = jnp.sum((J.T @ J - I) ** 2) # orthonormality: Frobenius norm of JᵀJ - I
+        term_pos = jax.nn.softplus(-detJ)       # orientation hinge: penalize negative det softly
+        return (alpha_det * term_det + beta_orth * term_orth + gamma_pos * term_pos)[None]
 
 
 class NNDoubleIntegratorROM(DoubleIntegratorROM):
@@ -183,7 +301,7 @@ class IntegratorOutput:
     
     
 @flax_dataclass
-class IntegratorDebugOutput:
+class IntegratorAuxOutput:
     xs: jnp.ndarray
     ys: jnp.ndarray
     zs: jnp.ndarray
@@ -193,6 +311,15 @@ class IntegratorDebugOutput:
     ts: jnp.ndarray
     lyaps: jnp.ndarray
 
+
+@flax_dataclass
+class LossOutput:
+    y_proj: jnp.ndarray
+    z_proj: jnp.ndarray
+    stable_m: jnp.ndarray
+    invari_m: jnp.ndarray
+    nondegenerate_enc: jnp.ndarray
+    total: jnp.ndarray
 
 class Integrator(PyTreeNode):
     solver: Callable
@@ -229,7 +356,7 @@ class Integrator(PyTreeNode):
         )
         int_out = int_out.replace(xs=int_out.xs.at[:,0].set(x0s))
         
-        def body(i, carry):
+        def step(i, carry):
             int_out = carry
             x_curr = int_out.xs[:, i]                                 # (B,2)
             y, z   = vmap(self.rom.encode, in_axes=0)(x_curr)         # (B,1),(B,1)
@@ -250,31 +377,31 @@ class Integrator(PyTreeNode):
                 xs=int_out.xs.at[:, i + 1].set(sol.ys[-1]),
                 us=int_out.us.at[:, i].set(u),
             )
-
-            return jax.lax.fori_loop(0, self.n_steps, body, int_out)
         
-        int_out_final = jax.lax.fori_loop(
+        return jax.lax.fori_loop(
             lower=0, 
             upper=self.n_steps, 
-            body_fun=body, 
+            body_fun=step, 
             init_val=int_out
         )
-        return int_out_final
     
     
-    def post_apply(self, int_out: IntegratorOutput) -> IntegratorDebugOutput:
-        ''' Augment IntegratorOutput with debug information. '''
+    def post_apply(self, int_out: IntegratorOutput) -> tuple[IntegratorAuxOutput, LossOutput]:
+        ''' Augment IntegratorOutput with debug information. 
+        Note: last time step in `xs` is truncated. So both `xs` and `us` have shape (B,T,*).
+        '''
         xs, us = int_out.xs, int_out.us
-        B, T = xs.shape[0:2]
+        B, T = us.shape[0:2]
+        xs = xs[:, :-1, :]
         flat_xs = rearrange(xs, 'b t d -> (b t) d')
+        flat_us = rearrange(us, 'b t d -> (b t) d')
 
         ys, zs = vmap(self.rom.encode, in_axes=0)(flat_xs)       # (B*T1,1), (B*T1,1)
         vs     = vmap(self.rom.policy_v, in_axes=(0, 0))(ys, zs) # (B*T1,1)
         psis   = vmap(self.rom.policy_psi, in_axes=0)(zs)        # (B*T1,1)
         es     = jnp.abs(ys - psis)                              # (B*T1,1)
         lyaps  = vmap(self.rom.lyap, in_axes=0)(zs)              # (B*T1,1)
-        
-        return IntegratorDebugOutput(
+        aux_out = IntegratorAuxOutput(
             xs, 
             rearrange(ys,   '(b t) d -> b t d', b=B), 
             rearrange(zs,   '(b t) d -> b t d', b=B), 
@@ -284,7 +411,25 @@ class Integrator(PyTreeNode):
             self.ts, 
             rearrange(lyaps,'(b t) d -> b t d', b=B)
         )
-    
+
+        l_y_proj = vmap(self.rom.loss_y_proj, in_axes=(0, 0))(flat_xs, flat_us)
+        l_z_proj = vmap(self.rom.loss_z_proj, in_axes=(0, 0))(flat_xs, flat_us)
+        l_stable_m = vmap(self.rom.loss_stable_m, in_axes=0)(zs)
+        l_invari_m = vmap(self.rom.loss_invari_m, in_axes=0)(zs)
+        l_nondegenerate_enc = vmap(self.rom.loss_nondegenerate_enc, in_axes=0)(flat_xs)
+        total = l_y_proj + l_z_proj + l_stable_m + l_invari_m + l_nondegenerate_enc
+        loss_out = LossOutput(
+            y_proj=rearrange(l_y_proj, '(b t) d -> b t d', b=B),
+            z_proj=rearrange(l_z_proj, '(b t) d -> b t d', b=B),
+            stable_m=rearrange(l_stable_m, '(b t) d -> b t d', b=B),
+            invari_m=rearrange(l_invari_m, '(b t) d -> b t d', b=B),
+            nondegenerate_enc=rearrange(l_nondegenerate_enc, '(b t) d -> b t d', b=B),
+            total=rearrange(total, '(b t) d -> b t d', b=B),
+        )
+        
+        return aux_out, loss_out
+
+
 
 
 if __name__ == "__main__":
