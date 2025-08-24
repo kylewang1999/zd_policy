@@ -16,6 +16,10 @@ class CfgRollout:
     t0: float = 0.0
     t1: float = 5.0
     dt: float = 0.01
+    
+    @property
+    def ts(self) -> jnp.ndarray:
+        return jnp.arange(self.t0, self.t1 + self.dt, self.dt)
 
 @flax_dataclass
 class CfgDIROM:
@@ -28,16 +32,25 @@ class CfgDIROM:
     kv: float = 1.0
     lamv: float = 4.0
     rngs: nnx.Rngs = field(pytree_node=False, default=nnx.Rngs(0))
+   
+    loss_scale_dict: dict[str, float] = field(pytree_node=False, default_factory=lambda: {
+        "y_proj": 1.0,
+        "z_proj": 1.0,
+        "stable_m": 1.0,
+        "invari_m": 1.0,
+        "nondegenerate_enc": 0.0,
+    })
 
 
-class DoubleIntegratorROM(PyTreeNode):
-    cfg_rom: CfgDIROM = field(pytree_node=False, default=CfgDIROM())
+class DoubleIntegratorROM():
+    
+    def __init__(self, cfg_rom: CfgDIROM):
+        self.cfg_rom = cfg_rom
     
     '''
     Note: Input to any of the following functions should not be batched.
           Batched-application should be done explictly using vmap.
     '''
-    
 
     def encode(self, x: jnp.ndarray) -> tuple[float, float]:
         '''
@@ -196,14 +209,17 @@ class DoubleIntegratorROM(PyTreeNode):
         return (alpha_det * term_det + beta_orth * term_orth + gamma_pos * term_pos)[None]
 
 
-class NNDoubleIntegratorROM(DoubleIntegratorROM):
-    cfg_rom: CfgDIROM = field(pytree_node=False, default=CfgDIROM())
-    nn_encoder: nnx.Module = field(pytree_node=False, default=nnx.Linear(2, 2, use_bias=False, rngs=nnx.Rngs(0)))
-    nn_decoder: nnx.Module = field(pytree_node=False, default=nnx.Linear(2, 2, use_bias=False, rngs=nnx.Rngs(0)))
-    nn_fy: nnx.Module = field(pytree_node=False, default=nnx.Linear(1, 1, use_bias=False, rngs=nnx.Rngs(0)))
-    nn_gy: nnx.Module = field(pytree_node=False, default=nnx.Linear(1, 1, use_bias=True,  rngs=nnx.Rngs(0)))
-    nn_fz: nnx.Module = field(pytree_node=False, default=nnx.Linear(2, 1, use_bias=False, rngs=nnx.Rngs(0)))
-    nn_psi: nnx.Module = field(pytree_node=False, default=nnx.Linear(1, 1, use_bias=False, rngs=nnx.Rngs(0)))
+class NNDoubleIntegratorROM(DoubleIntegratorROM, nnx.Module):
+
+    def __init__(self, cfg_rom: CfgDIROM, rngs: nnx.Rngs=nnx.Rngs(0)):
+        super().__init__(cfg_rom)
+        self.nn_encoder = nnx.Linear(2, 2, use_bias=False, rngs=rngs)
+        self.nn_decoder = nnx.Linear(2, 2, use_bias=False, rngs=rngs)
+        self.nn_fy      = nnx.Linear(1, 1, use_bias=False, rngs=rngs)
+        self.nn_gy      = nnx.Linear(1, 1, use_bias=True,  rngs=rngs)
+        self.nn_fz      = nnx.Linear(2, 1, use_bias=False, rngs=rngs)
+        self.nn_psi     = nnx.Linear(1, 1, use_bias=False, rngs=rngs)
+
 
     @property
     def default_nn_params(self) -> dict:
@@ -229,33 +245,18 @@ class NNDoubleIntegratorROM(DoubleIntegratorROM):
             out[name] = d
         return out
     
-    def set_nn_params(self, params: dict, *, strict: bool = True, cast: bool = True) -> None:
-        '''
-        Params:
-            params: dict of module names to dicts of attributes to values
-            strict: if True, raise an error if a module or attribute is not found
-            cast: if True, cast the values to the correct dtype
-        '''
-        for name, pdict in params.items():
-            mod = getattr(self, name, None)
-            if mod is None:
-                if strict:
-                    raise AttributeError(f"Module '{name}' not found on self.")
-                else:
-                    continue
-            for attr, arr in pdict.items():
-                if not hasattr(mod, attr):
-                    if strict:
-                        raise AttributeError(f"Module '{name}' has no attribute '{attr}'.")
-                    else:
-                        continue
-                ref = getattr(mod, attr).value
-                val = jnp.asarray(arr, dtype=ref.dtype) if cast else arr
-                # sanity check shapes:
-                if ref.shape != val.shape:
-                    raise ValueError(f"Shape mismatch for {name}.{attr}: expected {ref.shape}, got {val.shape}.")
-                getattr(mod, attr).value = val
-    
+    def set_nn_params(self, params: dict):
+        for name, pd in params.items():
+            mod = getattr(self, name)
+            for attr, arr in pd.items():
+                
+                val = getattr(mod, attr).value
+                if val is None: continue
+                
+                arr = jnp.asarray(arr, dtype=val.dtype)
+                if arr.shape != val.shape:
+                    raise ValueError(f"Shape mismatch for {name}.{attr}: {arr.shape} vs {val.shape}")
+                getattr(mod, attr).value = arr
     
     def hardcode_nn_params(self):
         self.set_nn_params(self.default_nn_params)
@@ -285,7 +286,7 @@ class NNDoubleIntegratorROM(DoubleIntegratorROM):
         y = jnp.atleast_1d(y)
         z = jnp.atleast_1d(z)
         gy   = self.nn_gy(y)
-        ginv = 1.0 / gy
+        ginv = 1.0 / (gy + 1e-8)
         zdot = self.dyn_z(y, z)
         _, dpsi_omega = jax.jvp(self.policy_psi, (z,), (zdot,))
         fy = self.nn_fy(y)
@@ -322,12 +323,16 @@ class LossOutput:
     invari_m: jnp.ndarray
     nondegenerate_enc: jnp.ndarray
     total: jnp.ndarray
+    
+    @property
+    def attrs(self):
+        return ("y_proj", "z_proj", "stable_m", "invari_m", "nondegenerate_enc", "total")
+
 
 
 class Integrator(PyTreeNode):
     solver: Callable
     ts: jnp.array = field(pytree_node=False)
-    rom: DoubleIntegratorROM = field(pytree_node=False, default=DoubleIntegratorROM())
 
     @property
     def dt0(self) -> float: return self.ts[1] - self.ts[0]
@@ -336,137 +341,91 @@ class Integrator(PyTreeNode):
     def n_steps(self) -> int: return len(self.ts) - 1
 
 
-    def init(self, rng, t, x0, mutable=flax.core.DenyList('intermediates')):
-        # place holder for policy and robot NN parameters
-        return {
-            "policy": {},
-            "robot": {},
-            "iter": 0
-        }
-
-
-    def apply(self, x0s, policy_fun: Callable=None):
+    def apply(self, x0s, rom: DoubleIntegratorROM, policy_fun: Callable=None):
         ''' Integrate the dynamics from self.ts[0] to self.ts[-1] with initial condition x0s.
         Input:
             x0s: (B, 2)
         Output:
             int_out: IntegratorOutput containing xs (B,T+1,2) and us (B,T,1)
         '''
+        B = x0s.shape[0]
         if policy_fun is None:
-            policy_fun = self.rom.policy_v
+            policy_fun = rom.policy_v
         
         int_out = IntegratorOutput(
-            xs=jnp.zeros((x0s.shape[0], self.n_steps+1, 2)),  # (B, T+1, 2)
-            us=jnp.zeros((x0s.shape[0], self.n_steps, 1))     # (B, T, 1)
+            xs=jnp.zeros((B, self.n_steps+1, 2)),  # (B, T+1, 2)
+            us=jnp.zeros((B, self.n_steps, 1))     # (B, T, 1)
         )
+        
         int_out = int_out.replace(xs=int_out.xs.at[:,0].set(x0s))
         
         def step(i, carry):
             int_out = carry
             x_curr = int_out.xs[:, i]                          # (B,2)
-            y, z   = vmap(self.rom.encode, in_axes=0)(x_curr)  # (B,1),(B,1)
+            y, z   = vmap(rom.encode, in_axes=0)(x_curr)  # (B,1),(B,1)
             v      = vmap(policy_fun, in_axes=(0, 0))(y, z)    # (B,1)
-            u      = vmap(self.rom.map_v_to_u, in_axes=0)(v)
+            u      = vmap(rom.map_v_to_u, in_axes=0)(v)
 
             def _term(t, x, args):
-                return vmap(self.rom.dyn_x, in_axes=(0, 0))(x, v)     # (B,2)
+                return vmap(rom.dyn_x, in_axes=(0, 0))(x, u)     # (B,2)
 
             sol = self.solver(
                 dfx.ODETerm(_term),
-                dt0=self.dt0,
-                t0=self.ts[i],
-                t1=self.ts[i + 1],
-                y0=x_curr,
-                args=None,
+                dt0=self.dt0, t0=self.ts[i], t1=self.ts[i+1], y0=x_curr, args=None
             )
             return int_out.replace(
                 xs=int_out.xs.at[:, i + 1].set(sol.ys[-1]),
                 us=int_out.us.at[:, i].set(u),
             )
         
-        return jax.lax.fori_loop(
-            lower=0, 
-            upper=self.n_steps, 
-            body_fun=step, 
-            init_val=int_out
-        )
+        return jax.lax.fori_loop(0, self.n_steps, step, int_out)
     
-    
-    def post_apply(self, int_out: IntegratorOutput) -> tuple[IntegratorAuxOutput, LossOutput]:
+    def post_apply(self, int_out: IntegratorOutput, rom: DoubleIntegratorROM) -> IntegratorAuxOutput:
         ''' Augment IntegratorOutput with debug information. 
         Note: last time step in `xs` is truncated. So both `xs` and `us` have shape (B,T,*).
-        '''
+        '''        
         xs, us = int_out.xs, int_out.us
-        B, T = us.shape[0:2]
-        xs = xs[:, :-1, :]
-        flat_xs = rearrange(xs, 'b t d -> (b t) d')
-        flat_us = rearrange(us, 'b t d -> (b t) d')
+        B, T = us.shape[:2]
+        xs_t = xs[:, :-1, :]
+        flat_xs = rearrange(xs_t, 'b t d -> (b t) d')
 
-        ys, zs = vmap(self.rom.encode, in_axes=0)(flat_xs)       # (B*T1,1), (B*T1,1)
-        vs     = vmap(self.rom.policy_v, in_axes=(0, 0))(ys, zs) # (B*T1,1)
-        psis   = vmap(self.rom.policy_psi, in_axes=0)(zs)        # (B*T1,1)
-        es     = jnp.abs(ys - psis)                              # (B*T1,1)
-        lyaps  = vmap(self.rom.lyap, in_axes=0)(zs)              # (B*T1,1)
-        aux_out = IntegratorAuxOutput(
-            xs, 
-            rearrange(ys,   '(b t) d -> b t d', b=B), 
-            rearrange(zs,   '(b t) d -> b t d', b=B), 
-            us, 
-            rearrange(vs,   '(b t) d -> b t d', b=B), 
-            rearrange(es,   '(b t) d -> b t d', b=B), 
-            self.ts, 
-            rearrange(lyaps,'(b t) d -> b t d', b=B)
+        ys, zs = vmap(rom.encode)(flat_xs)
+        vs     = vmap(rom.policy_v)(ys, zs)
+        psis   = vmap(rom.policy_psi)(zs)
+        es     = jnp.abs(ys - psis)
+        lyaps  = vmap(rom.lyap)(zs)
+
+        return IntegratorAuxOutput(
+            xs_t,
+            rearrange(ys,    '(b t) d -> b t d', b=B),
+            rearrange(zs,    '(b t) d -> b t d', b=B),
+            us,
+            rearrange(vs,    '(b t) d -> b t d', b=B),
+            rearrange(es,    '(b t) d -> b t d', b=B),
+            self.ts,
+            rearrange(lyaps, '(b t) d -> b t d', b=B),
         )
-        
-        return aux_out
     
-    
-    def compute_loss(self, int_out: IntegratorOutput) -> LossOutput:
+    def compute_loss(self, int_out: IntegratorOutput, rom: DoubleIntegratorROM) -> LossOutput:
         xs, us = int_out.xs, int_out.us
-        B, T = us.shape[0:2]
-        xs = xs[:, :-1, :]
-        flat_xs = rearrange(xs, 'b t d -> (b t) d')
-        flat_us = rearrange(us, 'b t d -> (b t) d')
-        
-        ys, zs = vmap(self.rom.encode, in_axes=0)(flat_xs)       # (B*T1,1), (B*T1,1)
-        
-        l_y_proj = vmap(self.rom.loss_y_proj, in_axes=(0, 0))(flat_xs, flat_us)
-        l_z_proj = vmap(self.rom.loss_z_proj, in_axes=(0, 0))(flat_xs, flat_us)
-        l_stable_m = vmap(self.rom.loss_stable_m, in_axes=0)(zs)
-        l_invari_m = vmap(self.rom.loss_invari_m, in_axes=0)(zs)
-        l_nondegenerate_enc = vmap(self.rom.loss_nondegenerate_enc, in_axes=0)(flat_xs)
-        total = l_y_proj + l_z_proj + l_stable_m + l_invari_m + l_nondegenerate_enc
-        loss_out = LossOutput(
+        B, T = us.shape[:2]
+        xs_t = xs[:, :-1, :]
+        flat_xs = rearrange(xs_t, 'b t d -> (b t) d')
+        flat_us = rearrange(us,   'b t d -> (b t) d')
+
+        ys, zs = vmap(rom.encode)(flat_xs)
+        l_y_proj  = vmap(rom.loss_y_proj, in_axes=(0,0))(flat_xs, flat_us) * rom.cfg_rom.loss_scale_dict["y_proj"]
+        l_z_proj  = vmap(rom.loss_z_proj, in_axes=(0,0))(flat_xs, flat_us) * rom.cfg_rom.loss_scale_dict["z_proj"]
+        l_stab    = vmap(rom.loss_stable_m)(zs) * rom.cfg_rom.loss_scale_dict["stable_m"]
+        l_invari  = vmap(rom.loss_invari_m)(zs) * rom.cfg_rom.loss_scale_dict["invari_m"]
+        l_nondec  = vmap(rom.loss_nondegenerate_enc)(flat_xs) * rom.cfg_rom.loss_scale_dict["nondegenerate_enc"]
+        total     = l_y_proj + l_z_proj + l_stab + l_invari + l_nondec
+
+        return LossOutput(
             y_proj=rearrange(l_y_proj, '(b t) d -> b t d', b=B),
             z_proj=rearrange(l_z_proj, '(b t) d -> b t d', b=B),
-            stable_m=rearrange(l_stable_m, '(b t) d -> b t d', b=B),
-            invari_m=rearrange(l_invari_m, '(b t) d -> b t d', b=B),
-            nondegenerate_enc=rearrange(l_nondegenerate_enc, '(b t) d -> b t d', b=B),
+            stable_m=rearrange(l_stab, '(b t) d -> b t d', b=B),
+            invari_m=rearrange(l_invari, '(b t) d -> b t d', b=B),
+            nondegenerate_enc=rearrange(l_nondec, '(b t) d -> b t d', b=B),
             total=rearrange(total, '(b t) d -> b t d', b=B),
         )
-        
-        return loss_out
-
-
-
-@flax_dataclass
-class CfgTrain:
-    pass
-
-
-if __name__ == "__main__":
-    cfg_rom = CfgDIROM()
-    cfg_rollout = CfgRollout()
-
-    rng = jax.random.PRNGKey(42)
-    ts = jnp.arange(cfg_rollout.t0, cfg_rollout.t1 + cfg_rollout.dt, cfg_rollout.dt)
-    x0s_batch = jax.random.normal(rng, (20, 2))
-
-    integrator = Integrator(
-        solver=partial(dfx.diffeqsolve, solver=dfx.Tsit5()),
-        ts=ts,
-        rom=DoubleIntegratorROM(cfg_rom=cfg_rom),
-    )
-
-    out = integrator.apply(x0s_batch)
-    print("Batched integrator shape:", out.xs.shape)   # (B, T, 2)
