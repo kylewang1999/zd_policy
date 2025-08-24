@@ -33,26 +33,35 @@ class CfgDIROM:
 class DoubleIntegratorROM(PyTreeNode):
     cfg_rom: CfgDIROM = field(pytree_node=False, default=CfgDIROM())
     
+    '''
+    Note: Input to any of the following functions should not be batched.
+          Batched-application should be done explictly using vmap.
+    '''
+    
 
     def encode(self, x: jnp.ndarray) -> tuple[float, float]:
-        y = x[..., 1]
-        z = x[..., 0]
+        '''
+        Input: (2,). Should not be batched.
+        Output: Tuple[(1,), (1,)]
+        '''
+        y = x[..., 1:2]
+        z = x[..., 0:1]
         return y, z
 
     def decode(self, y: float | jnp.ndarray, z: float | jnp.ndarray) -> jnp.ndarray:
         return jnp.hstack([z, y])
 
     def dyn_x(self, x: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
-        x1dot = x[..., 1]
-        x2dot = u
+        x1dot = x[..., 1:2]
+        x2dot = jnp.atleast_1d(u)
         return jnp.hstack([x1dot, x2dot])
 
     def dyn_y(self, y:jnp.array, u:jnp.array) -> jnp.array:
-        ydot = u
+        ydot = jnp.atleast_1d(u)
         return ydot
 
     def dyn_z(self, y:jnp.array, z:jnp.array) -> jnp.array:
-        zdot = y
+        zdot = jnp.atleast_1d(y)
         return zdot
     
     def policy_v(self, y: jnp.ndarray, z: jnp.ndarray) -> jnp.array:
@@ -66,75 +75,103 @@ class DoubleIntegratorROM(PyTreeNode):
         return 0.5 * self.cfg_rom.kv * (z ** 2)
 
 
-
 class NNDoubleIntegratorROM(DoubleIntegratorROM):
     cfg_rom: CfgDIROM = field(pytree_node=False, default=CfgDIROM())
     rngs: nnx.Rngs = field(pytree_node=False, default=nnx.Rngs(0))
-    nn_encoder: nnx.Module = field(pytree_node=False, default=nnx.Linear(2,2, use_bias=False, rngs=nnx.Rngs(0)))
-    nn_decoder: nnx.Module = field(pytree_node=False, default=nnx.Linear(2,2, use_bias=False, rngs=nnx.Rngs(0)))
-    nn_fy: nnx.Module = field(pytree_node=False, default=nnx.Linear(1,1, use_bias=False, rngs=nnx.Rngs(0)))
-    nn_gy: nnx.Module = field(pytree_node=False, default=nnx.Linear(1,1, use_bias=True, rngs=nnx.Rngs(0)))
-    nn_fz: nnx.Module = field(pytree_node=False, default=nnx.Linear(2,1, use_bias=False, rngs=nnx.Rngs(0)))
-    nn_psi: nnx.Module = field(pytree_node=False, default=nnx.Linear(1,1, use_bias=False, rngs=nnx.Rngs(0)))
-    
-    
-    def hardcode_nn_params(self, ):
-        """Explicitly set parameters for all neural network modules.
-        
-        Args:
-            params: Dictionary containing parameter arrays for each module.
-                   Keys should match the module names (e.g., 'nn_decoder', 'nn_gy', etc.)
-        """
+    nn_encoder: nnx.Module = field(pytree_node=False, default=nnx.Linear(2, 2, use_bias=False, rngs=nnx.Rngs(0)))
+    nn_decoder: nnx.Module = field(pytree_node=False, default=nnx.Linear(2, 2, use_bias=False, rngs=nnx.Rngs(0)))
+    nn_fy: nnx.Module = field(pytree_node=False, default=nnx.Linear(1, 1, use_bias=False, rngs=nnx.Rngs(0)))
+    nn_gy: nnx.Module = field(pytree_node=False, default=nnx.Linear(1, 1, use_bias=True,  rngs=nnx.Rngs(0)))
+    nn_fz: nnx.Module = field(pytree_node=False, default=nnx.Linear(2, 1, use_bias=False, rngs=nnx.Rngs(0)))
+    nn_psi: nnx.Module = field(pytree_node=False, default=nnx.Linear(1, 1, use_bias=False, rngs=nnx.Rngs(0)))
 
-        self.nn_encoder.kernel.value = jnp.array([[0.0, 1.0], [1.0, 0.0]])
-        self.nn_decoder.kernel.value = jnp.array([[0.0, 1.0], [1.0, 0.0]])
+    @property
+    def default_nn_params(self) -> dict:
+        kpsi = float(self.cfg_rom.kpsi)
+        return {
+            "nn_encoder": {"kernel": jnp.array([[0., 1.], [1., 0.]])},        
+            "nn_decoder": {"kernel": jnp.array([[0., 1.], [1., 0.]])},        
+            "nn_fy":      {"kernel": jnp.array([[0.]])},                      
+            "nn_gy":      {"kernel": jnp.array([[0.]]), "bias": jnp.array([1.])},
+            "nn_fz":      {"kernel": jnp.array([[1.], [0.]])},                # ż = y
+            "nn_psi":     {"kernel": jnp.array([[kpsi]])},                    # ψ(z) = kψ z (we negate outside)
+        }
         
-        self.nn_fy.kernel.value = jnp.array([[0.0]])
-        self.nn_gy.kernel.value = jnp.array([[0.0]])
-        self.nn_gy.bias.value = jnp.array([1.0])
-        
-        self.nn_fz.kernel.value = jnp.array([[1.0], [0.0]])
-        self.nn_psi.kernel.value = jnp.array([[self.cfg_rom.kpsi]])
+    def get_nn_params(self) -> dict:
+        out = {}
+        for name in ("nn_encoder", "nn_decoder", "nn_fy", "nn_gy", "nn_fz", "nn_psi"):
+            mod = getattr(self, name)
+            d = {}
+            if hasattr(mod, "kernel"):
+                d["kernel"] = mod.kernel.value
+            if hasattr(mod, "bias"):
+                d["bias"] = mod.bias.value
+            out[name] = d
+        return out
+    
+    def set_nn_params(self, params: dict, *, strict: bool = True, cast: bool = True) -> None:
+        '''
+        Params:
+            params: dict of module names to dicts of attributes to values
+            strict: if True, raise an error if a module or attribute is not found
+            cast: if True, cast the values to the correct dtype
+        '''
+        for name, pdict in params.items():
+            mod = getattr(self, name, None)
+            if mod is None:
+                if strict:
+                    raise AttributeError(f"Module '{name}' not found on self.")
+                else:
+                    continue
+            for attr, arr in pdict.items():
+                if not hasattr(mod, attr):
+                    if strict:
+                        raise AttributeError(f"Module '{name}' has no attribute '{attr}'.")
+                    else:
+                        continue
+                ref = getattr(mod, attr).value
+                val = jnp.asarray(arr, dtype=ref.dtype) if cast else arr
+                # sanity check shapes:
+                if ref.shape != val.shape:
+                    raise ValueError(f"Shape mismatch for {name}.{attr}: expected {ref.shape}, got {val.shape}.")
+                getattr(mod, attr).value = val
     
     
-    def encode(self, x: jnp.ndarray) -> tuple[float, float]:
+    def hardcode_nn_params(self):
+        self.set_nn_params(self.default_nn_params)
+
+
+    def encode(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         yz = self.nn_encoder(x)
-        y, z = yz[..., 0], yz[..., 1]
+        y, z = yz[0:1], yz[1:2]
         return y, z
-    
+
     def decode(self, y: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
-        return self.nn_decoder(jnp.stack([y, z], axis=-1))
-    
+        return self.nn_decoder(jnp.hstack([y, z]))
+
     def dyn_x(self, x: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
         return super().dyn_x(x, u)
-    
+
     def dyn_y(self, y: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
         return self.nn_fy(y) + self.nn_gy(y) * u
-    
+
     def dyn_z(self, y: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
         return self.nn_fz(jnp.hstack([y, z]))
-    
+
     def policy_psi(self, z: jnp.ndarray) -> jnp.ndarray:
         return -self.nn_psi(z)
-    
-    def dist_to_manifold(self, y: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
-        return y - self.policy_psi(z)
-    
-    def policy_v(self, y: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:   
+
+    def policy_v(self, y: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
         y = jnp.atleast_1d(y)
         z = jnp.atleast_1d(z)
-        
-        gy = self.nn_gy(y)
-        g_inv = 1.0 / gy
+        gy   = self.nn_gy(y)
+        ginv = 1.0 / gy
         zdot = self.dyn_z(y, z)
-        
-        _, dpsidz_times_omega = jax.jvp(self.policy_psi, (z,), (zdot,))
+        _, dpsi_omega = jax.jvp(self.policy_psi, (z,), (zdot,))
         fy = self.nn_fy(y)
-        return g_inv * (dpsidz_times_omega
-                        - self.cfg_rom.ke * self.dist_to_manifold(y, z)
-                        - fy)
-    
-    def lyap(self, z: jnp.array) -> float:
+        return ginv * (dpsi_omega - self.cfg_rom.ke * (y - self.policy_psi(z)) - fy)
+
+    def lyap(self, z: jnp.ndarray) -> jnp.ndarray:
         return super().lyap(z)
 
 
@@ -183,7 +220,7 @@ class Integrator(PyTreeNode):
         Input:
             x0s: (B, 2)
         Output:
-            int_out: IntegratorOutput
+            int_out: IntegratorOutput containing xs (B,T+1,2) and us (B,T,1)
         '''
         
         int_out = IntegratorOutput(
@@ -194,34 +231,27 @@ class Integrator(PyTreeNode):
         
         def body(i, carry):
             int_out = carry
-            x_curr = int_out.xs[:,i]
-            y, z = vmap(self.rom.encode, in_axes=0)(x_curr)
-            u = vmap(self.rom.policy_v, in_axes=(0, 0))(y, z)
-            
-            if u.ndim == 1:
-                u = u[:,None]
+            x_curr = int_out.xs[:, i]                                 # (B,2)
+            y, z   = vmap(self.rom.encode, in_axes=0)(x_curr)         # (B,1),(B,1)
+            u      = vmap(self.rom.policy_v, in_axes=(0, 0))(y, z)    # (B,1)
 
             def _term(t, x, args):
-                # args is (params, u), use self.args_dfx for dynamics function
-                # return self.args_dfx.dyn_x(x, args[1].squeeze())
-                return vmap(self.rom.dyn_x, in_axes=(0, 0))(x, u)
-            
+                return vmap(self.rom.dyn_x, in_axes=(0, 0))(x, u)     # (B,2)
+
             sol = self.solver(
                 dfx.ODETerm(_term),
                 dt0=self.dt0,
                 t0=self.ts[i],
                 t1=self.ts[i + 1],
                 y0=x_curr,
-                # args=(params, u)
                 args=None,
             )
-            
-            int_out = int_out.replace(
-                xs=int_out.xs.at[:,i + 1].set(sol.ys[-1]),
-                us=int_out.us.at[:,i].set(u)
+            return int_out.replace(
+                xs=int_out.xs.at[:, i + 1].set(sol.ys[-1]),
+                us=int_out.us.at[:, i].set(u),
             )
 
-            return int_out
+            return jax.lax.fori_loop(0, self.n_steps, body, int_out)
         
         int_out_final = jax.lax.fori_loop(
             lower=0, 
@@ -234,25 +264,26 @@ class Integrator(PyTreeNode):
     
     def post_apply(self, int_out: IntegratorOutput) -> IntegratorDebugOutput:
         ''' Augment IntegratorOutput with debug information. '''
-        xs, us = int_out.xs, int_out.us # (B, T+1, 2), (B, T, 1)
-        B = xs.shape[0]
-        ys, zs = vmap(self.rom.encode, in_axes=0)(rearrange(xs, 'b t d -> (b t) d'))
-        ys = ys[..., None]
-        zs = zs[..., None]
-        vs = vmap(self.rom.policy_v, in_axes=(0, 0))(ys, zs)
-        psis = vmap(self.rom.policy_psi, in_axes=0)(zs)
-        es = jnp.abs(ys - psis)
-        lyaps = vmap(self.rom.lyap, in_axes=0)(zs)
+        xs, us = int_out.xs, int_out.us
+        B, T = xs.shape[0:2]
+        flat_xs = rearrange(xs, 'b t d -> (b t) d')
+
+        ys, zs = vmap(self.rom.encode, in_axes=0)(flat_xs)       # (B*T1,1), (B*T1,1)
+        vs     = vmap(self.rom.policy_v, in_axes=(0, 0))(ys, zs) # (B*T1,1)
+        psis   = vmap(self.rom.policy_psi, in_axes=0)(zs)        # (B*T1,1)
+        es     = jnp.abs(ys - psis)                              # (B*T1,1)
+        lyaps  = vmap(self.rom.lyap, in_axes=0)(zs)              # (B*T1,1)
         
-        xs = xs
-        ys = rearrange(ys, '(b t) d -> b t d', b=B)
-        zs = rearrange(zs, '(b t) d -> b t d', b=B)
-        us = us
-        vs = rearrange(vs, '(b t) d -> b t d', b=B)
-        es = rearrange(es, '(b t) d -> b t d', b=B)
-        lyaps = rearrange(lyaps, '(b t) d -> b t d', b=B)
-        
-        return IntegratorDebugOutput(xs, ys, zs, us, vs, es, self.ts, lyaps)
+        return IntegratorDebugOutput(
+            xs, 
+            rearrange(ys,   '(b t) d -> b t d', b=B), 
+            rearrange(zs,   '(b t) d -> b t d', b=B), 
+            us, 
+            rearrange(vs,   '(b t) d -> b t d', b=B), 
+            rearrange(es,   '(b t) d -> b t d', b=B), 
+            self.ts, 
+            rearrange(lyaps,'(b t) d -> b t d', b=B)
+        )
     
 
 
