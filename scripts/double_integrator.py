@@ -16,19 +16,19 @@ class CfgRollout:
     t0: float = 0.0
     t1: float = 5.0
     dt: float = 0.01
-    
-@flax_dataclass
-class CfgPD:
-    kp: float = 1.0
-    kd: float = 1.0
-
 
 @flax_dataclass
 class CfgDIROM:
+    dim_x: int = 2
+    dim_y: int = 1
+    dim_z: int = 1
+    dim_u: int = 1
     kpsi: float = 1.0
     ke: float = 1.0
     kv: float = 1.0
     lamv: float = 4.0
+    rngs: nnx.Rngs = field(pytree_node=False, default=nnx.Rngs(0))
+
 
 class DoubleIntegratorROM(PyTreeNode):
     cfg_rom: CfgDIROM = field(pytree_node=False, default=CfgDIROM())
@@ -70,6 +70,9 @@ class DoubleIntegratorROM(PyTreeNode):
 
     def policy_psi(self, z: jnp.ndarray) -> jnp.array:
         return -self.cfg_rom.kpsi * z
+    
+    def map_v_to_u(self, v: jnp.ndarray) -> jnp.array:
+        return v
     
     def lyap(self, z: jnp.array) -> float:
         return 0.5 * self.cfg_rom.kv * (z ** 2)
@@ -195,7 +198,6 @@ class DoubleIntegratorROM(PyTreeNode):
 
 class NNDoubleIntegratorROM(DoubleIntegratorROM):
     cfg_rom: CfgDIROM = field(pytree_node=False, default=CfgDIROM())
-    rngs: nnx.Rngs = field(pytree_node=False, default=nnx.Rngs(0))
     nn_encoder: nnx.Module = field(pytree_node=False, default=nnx.Linear(2, 2, use_bias=False, rngs=nnx.Rngs(0)))
     nn_decoder: nnx.Module = field(pytree_node=False, default=nnx.Linear(2, 2, use_bias=False, rngs=nnx.Rngs(0)))
     nn_fy: nnx.Module = field(pytree_node=False, default=nnx.Linear(1, 1, use_bias=False, rngs=nnx.Rngs(0)))
@@ -321,6 +323,7 @@ class LossOutput:
     nondegenerate_enc: jnp.ndarray
     total: jnp.ndarray
 
+
 class Integrator(PyTreeNode):
     solver: Callable
     ts: jnp.array = field(pytree_node=False)
@@ -342,13 +345,15 @@ class Integrator(PyTreeNode):
         }
 
 
-    def apply(self, x0s):
+    def apply(self, x0s, policy_fun: Callable=None):
         ''' Integrate the dynamics from self.ts[0] to self.ts[-1] with initial condition x0s.
         Input:
             x0s: (B, 2)
         Output:
             int_out: IntegratorOutput containing xs (B,T+1,2) and us (B,T,1)
         '''
+        if policy_fun is None:
+            policy_fun = self.rom.policy_v
         
         int_out = IntegratorOutput(
             xs=jnp.zeros((x0s.shape[0], self.n_steps+1, 2)),  # (B, T+1, 2)
@@ -358,12 +363,13 @@ class Integrator(PyTreeNode):
         
         def step(i, carry):
             int_out = carry
-            x_curr = int_out.xs[:, i]                                 # (B,2)
-            y, z   = vmap(self.rom.encode, in_axes=0)(x_curr)         # (B,1),(B,1)
-            u      = vmap(self.rom.policy_v, in_axes=(0, 0))(y, z)    # (B,1)
+            x_curr = int_out.xs[:, i]                          # (B,2)
+            y, z   = vmap(self.rom.encode, in_axes=0)(x_curr)  # (B,1),(B,1)
+            v      = vmap(policy_fun, in_axes=(0, 0))(y, z)    # (B,1)
+            u      = vmap(self.rom.map_v_to_u, in_axes=0)(v)
 
             def _term(t, x, args):
-                return vmap(self.rom.dyn_x, in_axes=(0, 0))(x, u)     # (B,2)
+                return vmap(self.rom.dyn_x, in_axes=(0, 0))(x, v)     # (B,2)
 
             sol = self.solver(
                 dfx.ODETerm(_term),
@@ -411,7 +417,19 @@ class Integrator(PyTreeNode):
             self.ts, 
             rearrange(lyaps,'(b t) d -> b t d', b=B)
         )
-
+        
+        return aux_out
+    
+    
+    def compute_loss(self, int_out: IntegratorOutput) -> LossOutput:
+        xs, us = int_out.xs, int_out.us
+        B, T = us.shape[0:2]
+        xs = xs[:, :-1, :]
+        flat_xs = rearrange(xs, 'b t d -> (b t) d')
+        flat_us = rearrange(us, 'b t d -> (b t) d')
+        
+        ys, zs = vmap(self.rom.encode, in_axes=0)(flat_xs)       # (B*T1,1), (B*T1,1)
+        
         l_y_proj = vmap(self.rom.loss_y_proj, in_axes=(0, 0))(flat_xs, flat_us)
         l_z_proj = vmap(self.rom.loss_z_proj, in_axes=(0, 0))(flat_xs, flat_us)
         l_stable_m = vmap(self.rom.loss_stable_m, in_axes=0)(zs)
@@ -427,9 +445,13 @@ class Integrator(PyTreeNode):
             total=rearrange(total, '(b t) d -> b t d', b=B),
         )
         
-        return aux_out, loss_out
+        return loss_out
 
 
+
+@flax_dataclass
+class CfgTrain:
+    pass
 
 
 if __name__ == "__main__":
