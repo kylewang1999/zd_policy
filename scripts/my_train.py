@@ -9,28 +9,48 @@ import matplotlib.pyplot as plt
 
 from flax.struct import dataclass as flax_dataclass
 from flax.struct import field, PyTreeNode
+import jax.tree_util as jtu
+from flax.traverse_util import flatten_dict, unflatten_dict
 
 sys.path.append(osp.dirname(osp.dirname(osp.abspath(__file__))))
 
 from double_integrator import *
 
 
+
 @flax_dataclass
 class CfgData:
     box_width: float = 2.0  # box width for x0s
-    batch_size: int = 512
+    batch_size: int = 1024
     policies: list[str] = field(pytree_node=False, default_factory=lambda: ["policy_v", "noop"])
     policy_ratios: list[float] = field(pytree_node=False, default_factory=lambda: [0.5, 0.5])
 
 @flax_dataclass
 class CfgTrain:
-    num_epochs: int = 100
-    num_batches: int = 4
+    num_epochs: int = 30
+    num_batches: int = 5
     num_logs: int = 10
     lr: float = 1e-2
+    enable_lr_schedule: bool = False
     
+    
+def corrupt_params(rom: DoubleIntegratorROM | NNDoubleIntegratorROM, 
+                   rng: jax.random.PRNGKey,
+                   corruption_factor: float = 1.0):
+    params = rom.get_nn_params()
+    leaves, treedef = jtu.tree_flatten(params)
+    keys = jax.random.split(rng, len(leaves))
+    keys_tree = jtu.tree_unflatten(treedef, keys)
 
-def make_plots(rom: DoubleIntegratorROM, 
+    corrupted_params = jtu.tree_map(
+        lambda x, k: x + jax.random.normal(k, x.shape) * corruption_factor,
+        params, keys_tree
+    )
+    rom.set_nn_params(corrupted_params)
+
+ 
+
+def make_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM, 
                ret: IntegratorOutput, 
                aux_ret: IntegratorAuxOutput, 
                loss_ret: LossOutput, 
@@ -39,19 +59,19 @@ def make_plots(rom: DoubleIntegratorROM,
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
     ax1.set_xlim(-box_width, box_width)
     ax1.set_ylim(-box_width, box_width)
-    ax2.set_xlim(-0.1, 0.1)
-    ax2.set_ylim(-0.1, 0.1)
+    ax2.set_xlim(-box_width/5, box_width/5)
+    ax2.set_ylim(-box_width/5, box_width/5)
     ax1.set_title('(x1,x2) trajectories')
     ax2.set_title('(x1,x2) trajectories (zoomed)')
-
-    for ax in (ax1, ax2):
-        ax.set_xlabel('x1 (z)')
-        ax.set_ylabel('x2 (y)')
+    for ax in (ax1, ax2, ax3):
+        ax.set_xlabel('x1')
+        ax.set_ylabel('x2')
         ax.grid(True, alpha=0.3)
 
-    # Zero dynamics line
-    x1s = jnp.linspace(-box_width, box_width, 100)
-    x2s = -rom.cfg_rom.kpsi * x1s
+    # zero dynamics line
+    x1s = jnp.linspace(-box_width, box_width, 100).reshape(-1,1)
+    psi_slope = jax.vmap(jax.grad(lambda x: rom.policy_psi(x).squeeze()))(x1s).squeeze()
+    x2s = psi_slope * x1s
     for ax in (ax1, ax2, ax3):
         ax.plot(x1s, x2s, 'k--', linewidth=2, label='Zero dynamics line')
 
@@ -68,12 +88,18 @@ def make_plots(rom: DoubleIntegratorROM,
         jnp.linspace(-box_width, box_width, N),
         indexing='xy'
     )
-    U = X2
-    V = jax.vmap(rom.policy_v, in_axes=(0, 0))(
-        rearrange(X2, 'n1 n2 -> (n1 n2)'), rearrange(X1, 'n1 n2 -> (n1 n2)')
-    )
-    V = rearrange(V.squeeze(), '(n1 n2) -> n1 n2', n1=N, n2=N)
-    X1n, X2n, Un, Vn = map(np.asarray, (X1, X2, U, V))
+    
+    flat_x = jnp.stack([rearrange(X1, 'n1 n2 -> (n1 n2)'),
+                        rearrange(X2, 'n1 n2 -> (n1 n2)')], axis=-1) 
+    ys, zs = jax.vmap(rom.encode, in_axes=(0,))(flat_x)
+    v_flat = jax.vmap(rom.policy_v, in_axes=(0, 0))(ys, zs)
+    u_flat = jax.vmap(rom.map_v_to_u, in_axes=(0,))(v_flat)
+    flax_dx = jax.vmap(rom.dyn_x, in_axes=(0, 0))(flat_x, u_flat)
+    
+    DX1 = rearrange(flax_dx[:, 0], '(n1 n2) -> n1 n2', n1=N, n2=N)
+    DX2 = rearrange(flax_dx[:, 1], '(n1 n2) -> n1 n2', n1=N, n2=N)
+    
+    X1n, X2n, Un, Vn = map(np.asarray, (X1, X2, DX1, DX2))
     ax3.streamplot(X1n, X2n, Un, Vn, density=1.2, linewidth=0.8, arrowsize=1.2, minlength=0.2)
             
     plt.show()
@@ -91,9 +117,8 @@ def make_plots(rom: DoubleIntegratorROM,
         ax1.plot(aux_ret.ts[:-1], aux_ret.es[i])
         ax2.plot(aux_ret.ts[:-1], aux_ret.lyaps[i])
         
-    
-    
-    attrs = ["y_proj", "z_proj", "stable_m", "invari_m", "nondegenerate_enc"]
+    # loss components
+    attrs = ["autoencode", "y_proj", "z_proj", "stable_m", "invari_m", "nondegenerate_enc"]
     fig, axes = plt.subplots(1, len(attrs), figsize=(4*len(attrs), 3))
     for ax, attr in zip(axes, attrs):
         ax.set_title(attr)
@@ -131,6 +156,27 @@ def get_expert_batch(rom: DoubleIntegratorROM,
     return ret_policy_v, ret_policy_noop
 
 
+
+# Which submodules (by name) to freeze
+FROZEN = ("nn_encoder", "nn_decoder", "nn_fy", "nn_gy", "nn_fz")
+
+def freeze_parameters(rom: NNDoubleIntegratorROM):
+    """
+    Freeze specified parameters by replacing them with nnx.Variable instead of nnx.Param.
+    This prevents them from being updated during training.
+    """
+    for module_name in FROZEN:
+        if hasattr(rom, module_name):
+            module = getattr(rom, module_name)
+            # Convert all Param variables to regular Variables (frozen)
+            for attr_name in ['kernel', 'bias']:
+                if hasattr(module, attr_name):
+                    param = getattr(module, attr_name)
+                    if isinstance(param, nnx.Param):
+                        # Replace with a frozen Variable
+                        setattr(module, attr_name, nnx.Variable(param.value))
+
+
 def train(rom: NNDoubleIntegratorROM, 
           integrator: Integrator, 
           cfg_train: CfgTrain, 
@@ -150,25 +196,38 @@ def train(rom: NNDoubleIntegratorROM,
         
         x0s = batch
         
-        def loss_fn(_m):
+        def loss_fn(_m: NNDoubleIntegratorROM):
             int_out  = integrator.apply(x0s, rom=_m)           
             loss_out = integrator.compute_loss(int_out, rom=_m)
-            return jnp.mean(loss_out.total), loss_out          
+            return jnp.mean(loss_out.total), loss_out
+
+            # loss_autoencode=jax.vmap(_m.loss_autoencoder, in_axes=(0,))(x0s) 
+            # return jnp.mean(loss_autoencode), None   
         
         return nnx.value_and_grad(loss_fn, has_aux=True)(model)
     
+    # Freeze the specified parameters before creating optimizer
+    freeze_parameters(rom)
+    
+    total_steps = cfg_train.num_epochs * cfg_train.num_batches
     lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.1 * cfg_train.lr, peak_value=cfg_train.lr,
-        warmup_steps=int(0.1 * cfg_train.num_epochs), decay_steps=cfg_train.num_epochs,
+        init_value=0.1 * cfg_train.lr, 
+        peak_value=cfg_train.lr,
+        warmup_steps=int(0.1 * total_steps), 
+        decay_steps=total_steps,
     )
-    tx  = optax.adam(lr_schedule)
+    if cfg_train.enable_lr_schedule:
+        tx = optax.adam(lr_schedule)
+    else:
+        tx = optax.adam(cfg_train.lr)
     opt = nnx.Optimizer(rom, tx, wrt=nnx.Param)
     rngs = jax.random.split(rng, cfg_train.num_batches)
+
     
     try:
         
+        global_step = 0
         epoch_losses = []
-        
         for i in (pbar := tqdm(range(cfg_train.num_epochs))):
             
             batch_losses = []
@@ -179,10 +238,11 @@ def train(rom: NNDoubleIntegratorROM,
                 
                 opt.update(grads=grads)
                 batch_losses.append(loss)
+                global_step += 1
                 
             epoch_loss = jnp.mean(jnp.array(batch_losses))
             epoch_losses.append(epoch_loss)
-            pbar.set_postfix({"loss": f"{epoch_loss:.2e}", "lr": f"{lr_schedule(i):.2e}"})
+            pbar.set_postfix({"loss": f"{epoch_loss:.2e}", "lr": f"{lr_schedule(global_step):.2e}"})
             
             if i % (cfg_train.num_epochs // cfg_train.num_logs) == 0:
                 pass
@@ -192,4 +252,6 @@ def train(rom: NNDoubleIntegratorROM,
         print("Training interrupted by user")
         return
     
-    plt.plot(np.arange(len(epoch_losses)), epoch_losses)
+    plt.plot(np.arange(len(epoch_losses)), epoch_losses, label="loss")
+    plt.title("Loss vs Epoch")
+    plt.show()
