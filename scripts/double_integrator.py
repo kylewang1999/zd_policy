@@ -21,8 +21,21 @@ class CfgRollout:
     def ts(self) -> jnp.ndarray:
         return jnp.arange(self.t0, self.t1 + self.dt, self.dt)
 
+
 @flax_dataclass
-class CfgDIROM:
+class CfgROM:
+
+    @property
+    def attrs(self):
+        return ("dim_x", "dim_y", "dim_z", "dim_u",
+                "kpsi",  # hand-picked linear zd policy gain
+                "ke",    # hand-picked zd manifold error gain
+                "kv",    # hand-picked lyapunov scale
+                "lamv"   # hand-picked lyapunov exponentiality
+        )
+
+@flax_dataclass
+class CfgDIROM(CfgROM):
     dim_x: int = 2
     dim_y: int = 1
     dim_z: int = 1
@@ -32,15 +45,20 @@ class CfgDIROM:
     kv: float = 1.0
     lamv: float = 1.0
     rngs: nnx.Rngs = field(pytree_node=False, default=nnx.Rngs(0))
-   
-    loss_scale_dict: dict[str, float] = field(pytree_node=False, default_factory=lambda: {
-        "autoencode"       : 0.0,
-        "y_proj"           : 0.0,
-        "z_proj"           : 0.0,
-        "stable_m"         : 1.0,
-        "invari_m"         : 0.0, # somehow this induces stabiltiy.        
-        "nondegenerate_enc": 0.0,
-    })
+    
+@flax_dataclass
+class CfgLoss: # scales to apply to each loss term
+    autoencoder: float = 0.0
+    y_proj: float = 0.0
+    z_proj: float = 0.0
+    stable_m: float = 0.0
+    invari_m: float = 0.0
+    nondegenerate_enc: float = 0.0
+    
+    @property
+    def attrs(self):
+        return ("autoencoder", "y_proj", "z_proj", 
+                "stable_m", "invari_m", "nondegenerate_enc")
 
 
 class DoubleIntegratorROM():
@@ -124,16 +142,15 @@ class DoubleIntegratorROM():
 
 
     # loss functions
-    def loss_autoencoder(self, x: jnp.ndarray) -> jnp.ndarray:
+    def loss_autoencoder(self, x, u, y, z) -> jnp.ndarray:
         '''
         L_auto = || x - decode(encode(x)) ||^2
         '''
-        y, z = self.encode(x)
         x_hat = self.decode(y, z)
         return self._sqnorm(x - x_hat)
     
     
-    def loss_y_proj(self, x: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
+    def loss_y_proj(self, x, u, y, z) -> jnp.ndarray:
         '''
         L_y = || Dy(x) f_xu - [ f_y(y) + G_y(y) u ] ||^2  (shape (1,))
         '''
@@ -148,7 +165,7 @@ class DoubleIntegratorROM():
         return self._sqnorm(term1 - term2)
 
 
-    def loss_z_proj(self, x: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
+    def loss_z_proj(self, x, u, y, z) -> jnp.ndarray:
         '''
         L_ω = || Dz(x) f_xu - ω(y,z) ||^2  (shape (1,))
         '''
@@ -160,10 +177,7 @@ class DoubleIntegratorROM():
         return self._sqnorm(term1 - term2)
 
 
-    def loss_stable_m(
-        self,
-        z: jnp.ndarray,
-    ) -> jnp.ndarray:
+    def loss_stable_m(self, x, u, y, z) -> jnp.ndarray:
         '''
         L_{ω,stab}(z) = max{0, <∇V(z), ω(y,z)> + λ V(z)} with 
             ∇V(z)=z, V=0.5||z||^2.
@@ -187,7 +201,7 @@ class DoubleIntegratorROM():
         
 
 
-    def loss_invari_m(self, z: jnp.ndarray) -> jnp.ndarray:
+    def loss_invari_m(self, x, u, y, z) -> jnp.ndarray:
         '''
         L_inv = || f(ψ(z),z) + G(ψ(z)) v(ψ(z),z) - (∂ψ/∂z)(z) ω(ψ(z),z) ||^2  (shape (1,))
         Uses per-sample v = policy_v(ψ(z), z), f,G from dyn_y decomposition.
@@ -203,12 +217,10 @@ class DoubleIntegratorROM():
         return self._sqnorm(term1 - term2)
 
 
-    def loss_nondegenerate_enc(
-        self,
-        x: jnp.ndarray,
-        alpha_det: float = 1.0,   # weight for (det-1)^2
-        beta_orth: float = 1.0,   # weight for ||JᵀJ - I||_F^2
-        gamma_pos: float = 0.0    # weight to prefer det>0 (orientation)
+    def loss_nondegenerate_enc(self,x, u, y, z,
+                               alpha_det: float = 1.0,   # weight for (det-1)^2
+                               beta_orth: float = 1.0,   # weight for ||JᵀJ - I||_F^2
+                               gamma_pos: float = 0.0    # weight to prefer det>0 (orientation)
     ) -> jnp.ndarray:
         '''
         Encourage J_E(x) ∈ SL(n) approximately: det→1, orthonormal columns, det>0.
@@ -334,7 +346,7 @@ class IntegratorAuxOutput:
 
 @flax_dataclass
 class LossOutput:
-    autoencode: jnp.ndarray
+    autoencoder: jnp.ndarray
     y_proj: jnp.ndarray
     z_proj: jnp.ndarray
     stable_m: jnp.ndarray
@@ -344,7 +356,7 @@ class LossOutput:
     
     @property
     def attrs(self):
-        return ("autoencode", "y_proj", "z_proj", "stable_m", "invari_m", "nondegenerate_enc", "total")
+        return ("autoencoder", "y_proj", "z_proj", "stable_m", "invari_m", "nondegenerate_enc", "total")
 
 
 
@@ -424,29 +436,25 @@ class Integrator(PyTreeNode):
             rearrange(lyaps, '(b t) d -> b t d', b=B),
         )
     
-    def compute_loss(self, int_out: IntegratorOutput, rom: DoubleIntegratorROM) -> LossOutput:
+    def compute_loss(self, 
+                     int_out: IntegratorOutput, 
+                     rom: DoubleIntegratorROM,
+                     cfg_loss: CfgLoss = CfgLoss()) -> LossOutput:
         xs, us = int_out.xs, int_out.us
         B, T = us.shape[:2]
         xs_t = xs[:, :-1, :]
         flat_xs = rearrange(xs_t, 'b t d -> (b t) d')
         flat_us = rearrange(us,   'b t d -> (b t) d')
-
-        ys, zs = vmap(rom.encode)(flat_xs)
-        l_autoencode  = vmap(rom.loss_autoencoder)(flat_xs) * rom.cfg_rom.loss_scale_dict["autoencode"]
-        l_y_proj  = vmap(rom.loss_y_proj, in_axes=(0,0))(flat_xs, flat_us) * rom.cfg_rom.loss_scale_dict["y_proj"]
-        l_z_proj  = vmap(rom.loss_z_proj, in_axes=(0,0))(flat_xs, flat_us) * rom.cfg_rom.loss_scale_dict["z_proj"]
-        l_stab    = vmap(rom.loss_stable_m)(zs) * rom.cfg_rom.loss_scale_dict["stable_m"]
-        l_invari  = vmap(rom.loss_invari_m)(zs) * rom.cfg_rom.loss_scale_dict["invari_m"]
-        l_nondec  = vmap(rom.loss_nondegenerate_enc)(flat_xs) * rom.cfg_rom.loss_scale_dict["nondegenerate_enc"]
+        flat_ys, flat_zs = vmap(rom.encode)(flat_xs)
         
-        total = l_autoencode + l_y_proj + l_z_proj + l_stab + l_invari + l_nondec
+        loss_dict = {}
+        for attr in cfg_loss.attrs:
+            loss_fn = getattr(rom, f"loss_{attr}")
+            loss_scale = getattr(cfg_loss, attr)
+            loss_term = vmap(loss_fn, in_axes=(0,0,0,0))(flat_xs, flat_us, flat_ys, flat_zs)
+            loss_term = rearrange(loss_term, '(b t) d -> b t d', b=B)
+            loss_dict[attr] = loss_term * loss_scale
+        
+        loss_dict["total"] = jnp.sum(jnp.stack(list(loss_dict.values())), axis=0)
 
-        return LossOutput(
-            autoencode=rearrange(l_autoencode, '(b t) d -> b t d', b=B),
-            y_proj=rearrange(l_y_proj, '(b t) d -> b t d', b=B),
-            z_proj=rearrange(l_z_proj, '(b t) d -> b t d', b=B),
-            stable_m=rearrange(l_stab, '(b t) d -> b t d', b=B),
-            invari_m=rearrange(l_invari, '(b t) d -> b t d', b=B),
-            nondegenerate_enc=rearrange(l_nondec, '(b t) d -> b t d', b=B),
-            total=rearrange(total, '(b t) d -> b t d', b=B),
-        )
+        return LossOutput(**loss_dict)

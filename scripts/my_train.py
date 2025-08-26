@@ -17,23 +17,22 @@ sys.path.append(osp.dirname(osp.dirname(osp.abspath(__file__))))
 from double_integrator import *
 
 
-
 @flax_dataclass
 class CfgData:
     box_width: float = 2.0  # box width for x0s
-    batch_size: int = 1024
+    batch_size: int = 512
     policies: list[str] = field(pytree_node=False, default_factory=lambda: ["policy_v", "noop"])
     policy_ratios: list[float] = field(pytree_node=False, default_factory=lambda: [0.5, 0.5])
 
 @flax_dataclass
 class CfgTrain:
-    num_epochs: int = 30
+    num_epochs: int = 20
     num_batches: int = 5
     num_logs: int = 10
-    lr: float = 1e-2
+    lr: float = 5e-2
     enable_lr_schedule: bool = False
-    
-    
+
+
 def corrupt_params(rom: DoubleIntegratorROM | NNDoubleIntegratorROM, 
                    rng: jax.random.PRNGKey,
                    corruption_factor: float = 1.0):
@@ -48,7 +47,6 @@ def corrupt_params(rom: DoubleIntegratorROM | NNDoubleIntegratorROM,
     )
     rom.set_nn_params(corrupted_params)
 
- 
 
 def make_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM, 
                ret: IntegratorOutput, 
@@ -118,9 +116,8 @@ def make_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM,
         ax2.plot(aux_ret.ts[:-1], aux_ret.lyaps[i])
         
     # loss components
-    attrs = ["autoencode", "y_proj", "z_proj", "stable_m", "invari_m", "nondegenerate_enc"]
-    fig, axes = plt.subplots(1, len(attrs), figsize=(4*len(attrs), 3))
-    for ax, attr in zip(axes, attrs):
+    fig, axes = plt.subplots(1, len(loss_ret.attrs), figsize=(4*len(loss_ret.attrs), 3))
+    for ax, attr in zip(axes, loss_ret.attrs):
         ax.set_title(attr)
         ax.set_xlabel('t')
         ax.grid(True, alpha=0.3)
@@ -129,6 +126,41 @@ def make_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM,
             ax.plot(aux_ret.ts[:-1], getattr(loss_ret, attr)[i])
 
     plt.show()
+
+
+def change_rom_param_type(rom: NNDoubleIntegratorROM, 
+                          to_param_type: nnx.Param | nnx.Variable,
+                          component_list: list[str] = ["nn_encoder", "nn_decoder", 
+                                                       "nn_fy", "nn_gy", "nn_fz"]):
+    """
+    Change the type of specified parameters to nnx.Variable instead of nnx.Param.
+    This prevents them from being updated during training.
+    - If to_param_type is nnx.Param, the parameters will be unfrozen.
+    - If to_param_type is nnx.Variable, the parameters will be frozen.
+    
+    """
+    for module_name in component_list:
+        if hasattr(rom, module_name):
+            module = getattr(rom, module_name)
+            # Convert all Param variables to regular Variables (frozen)
+            for attr_name in ['kernel', 'bias']:
+                if hasattr(module, attr_name):
+                    param = getattr(module, attr_name)
+                    if isinstance(param, nnx.Param):
+                        # Replace with a frozen Variable
+                        setattr(module, attr_name, to_param_type(param.value))
+                        
+                        
+def freeze_parameters(rom: NNDoubleIntegratorROM, 
+                      component_list: list[str] = ["nn_encoder", "nn_decoder", 
+                                                   "nn_fy", "nn_gy", "nn_fz"]):
+    change_rom_param_type(rom, nnx.Variable, component_list)
+    
+
+def unfreeze_parameters(rom: NNDoubleIntegratorROM, 
+                        component_list: list[str] = ["nn_encoder", "nn_decoder", 
+                                                     "nn_fy", "nn_gy", "nn_fz"]):
+    change_rom_param_type(rom, nnx.Param, component_list)
 
 
 def get_expert_batch(rom: DoubleIntegratorROM, 
@@ -156,58 +188,43 @@ def get_expert_batch(rom: DoubleIntegratorROM,
     return ret_policy_v, ret_policy_noop
 
 
+def get_batch(rng: jax.random.PRNGKey, 
+              cfg_data: CfgData = CfgData(),
+              cfg_rom: CfgROM = CfgROM()):
+    key_x = rng
+    x0s = jax.random.uniform(key_x, 
+                                (cfg_data.batch_size, cfg_rom.dim_x), 
+                                minval=-cfg_data.box_width, 
+                                maxval=cfg_data.box_width)
+    return x0s
 
-# Which submodules (by name) to freeze
-FROZEN = ("nn_encoder", "nn_decoder", "nn_fy", "nn_gy", "nn_fz")
+# @nnx.jit(static_argnames=("integrator",))
+# def step(model: NNDoubleIntegratorROM, batch: jnp.ndarray, integrator: Integrator):
+    
+#     def loss_fn(_m: NNDoubleIntegratorROM):
+#         int_out  = integrator.apply(batch, rom=_m)           
+#         loss_out = integrator.compute_loss(int_out, rom=_m)
+#         return jnp.mean(loss_out.total), loss_out
+    
+#     return nnx.value_and_grad(loss_fn, has_aux=True)(model)
 
-def freeze_parameters(rom: NNDoubleIntegratorROM):
-    """
-    Freeze specified parameters by replacing them with nnx.Variable instead of nnx.Param.
-    This prevents them from being updated during training.
-    """
-    for module_name in FROZEN:
-        if hasattr(rom, module_name):
-            module = getattr(rom, module_name)
-            # Convert all Param variables to regular Variables (frozen)
-            for attr_name in ['kernel', 'bias']:
-                if hasattr(module, attr_name):
-                    param = getattr(module, attr_name)
-                    if isinstance(param, nnx.Param):
-                        # Replace with a frozen Variable
-                        setattr(module, attr_name, nnx.Variable(param.value))
+def make_step_fn(integrator: Integrator):
+    @nnx.jit
+    def step(model: NNDoubleIntegratorROM, batch: jnp.ndarray):
+        def loss_fn(m: NNDoubleIntegratorROM):
+            int_out  = integrator.apply(batch, rom=m)
+            loss_out = integrator.compute_loss(int_out, rom=m)
+            return jnp.mean(loss_out.total), loss_out
+        return nnx.value_and_grad(loss_fn, has_aux=True)(model)
+    return step
 
 
 def train(rom: NNDoubleIntegratorROM, 
           integrator: Integrator, 
           cfg_train: CfgTrain, 
           cfg_data: CfgData, 
+          cfg_loss: CfgLoss,
           rng: jax.random.PRNGKey):
-
-    def get_batch(rng: jax.random.PRNGKey):
-        key_x = rng
-        x0s = jax.random.uniform(key_x, 
-                                 (cfg_data.batch_size, rom.cfg_rom.dim_x), 
-                                 minval=-cfg_data.box_width, 
-                                 maxval=cfg_data.box_width)
-        return x0s
-    
-    @nnx.jit
-    def step(model: NNDoubleIntegratorROM, batch):
-        
-        x0s = batch
-        
-        def loss_fn(_m: NNDoubleIntegratorROM):
-            int_out  = integrator.apply(x0s, rom=_m)           
-            loss_out = integrator.compute_loss(int_out, rom=_m)
-            return jnp.mean(loss_out.total), loss_out
-
-            # loss_autoencode=jax.vmap(_m.loss_autoencoder, in_axes=(0,))(x0s) 
-            # return jnp.mean(loss_autoencode), None   
-        
-        return nnx.value_and_grad(loss_fn, has_aux=True)(model)
-    
-    # Freeze the specified parameters before creating optimizer
-    freeze_parameters(rom)
     
     total_steps = cfg_train.num_epochs * cfg_train.num_batches
     lr_schedule = optax.warmup_cosine_decay_schedule(
@@ -222,6 +239,17 @@ def train(rom: NNDoubleIntegratorROM,
         tx = optax.adam(cfg_train.lr)
     opt = nnx.Optimizer(rom, tx, wrt=nnx.Param)
     rngs = jax.random.split(rng, cfg_train.num_batches)
+    
+    
+    @nnx.jit
+    def step(model: NNDoubleIntegratorROM, batch: jnp.ndarray):
+    
+        def loss_fn(_m: NNDoubleIntegratorROM):
+            int_out  = integrator.apply(batch, rom=_m)           
+            loss_out = integrator.compute_loss(int_out, rom=_m, cfg_loss=cfg_loss)
+            return jnp.mean(loss_out.total), loss_out
+        
+        return nnx.value_and_grad(loss_fn, has_aux=True)(model)
 
     
     try:
@@ -233,7 +261,8 @@ def train(rom: NNDoubleIntegratorROM,
             batch_losses = []
             for b in range(cfg_train.num_batches):
             
-                batch = get_batch(rngs[b])
+                batch = get_batch(rngs[b], cfg_data, rom.cfg_rom)
+                # step_fn = make_step_fn(integrator)
                 (loss, loss_out), grads = step(rom, batch)
                 
                 opt.update(grads=grads)
@@ -242,7 +271,8 @@ def train(rom: NNDoubleIntegratorROM,
                 
             epoch_loss = jnp.mean(jnp.array(batch_losses))
             epoch_losses.append(epoch_loss)
-            pbar.set_postfix({"loss": f"{epoch_loss:.2e}", "lr": f"{lr_schedule(global_step):.2e}"})
+            lr = lr_schedule(global_step) if cfg_train.enable_lr_schedule else cfg_train.lr
+            pbar.set_postfix({"loss": f"{epoch_loss:.2e}", "lr": f"{lr:.2e}"})
             
             if i % (cfg_train.num_epochs // cfg_train.num_logs) == 0:
                 pass
