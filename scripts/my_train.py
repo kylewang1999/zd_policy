@@ -73,15 +73,19 @@ def corrupt_params(rom: NNDoubleIntegratorROM,
 def make_traj_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM, 
                     int_out: IntegratorOutput, 
                     aux_out: IntegratorAuxOutput, 
-                    box_width: float = 2.0):
+                    box_width: float = 2.0,
+                    max_traj_num: int = 100):
+    
+    max_traj_num = min(max_traj_num, int_out.xs.shape[0])
     
     fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(1, 5, figsize=(25, 5))
     ax1.set_xlim(-box_width, box_width)
     ax1.set_ylim(-box_width, box_width)
     ax2.set_xlim(-box_width/5, box_width/5)
     ax2.set_ylim(-box_width/5, box_width/5)
-    ax1.set_title('(x1,x2) trajectories')
-    ax2.set_title('(x1,x2) trajectories (zoomed)')
+    ax1.set_title('(z1,z2) trajectories')
+    ax2.set_title('(z1,z2) trajectories (zoomed)')
+    ax3.set_title('(x1,x2) trajectories')
     for ax in (ax1, ax2, ax3):
         ax.set_xlabel('x1')
         ax.set_ylabel('x2')
@@ -92,7 +96,7 @@ def make_traj_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM,
         x1s = jnp.linspace(-box_width, box_width, 100).reshape(-1,1)
         psi_slope = jax.vmap(jax.grad(lambda x: rom.policy_psi(x).squeeze()))(x1s).squeeze()
         x2s = psi_slope * x1s
-        for ax in (ax1, ax2, ax3):
+        for ax in (ax1, ax2):
             ax.plot(x1s, x2s, 'k--', linewidth=2, label='Zero dynamics line')
             
     else:
@@ -107,11 +111,17 @@ def make_traj_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM,
             ax.plot(ys, zs, 'k--', linewidth=2, label='Zero dynamics line')
             # ax.plot(x1s, x2s, 'k--', linewidth=2, label='Zero dynamics line')
 
-    # rollout trajectories
+    # rollout trajectories in x space
+    # for ax in (ax1, ax2):
+    #     for i in range(int_out.xs.shape[0]):
+    #         ax.plot(int_out.xs[i, :, 0], int_out.xs[i, :, 1])
+    #         ax.scatter(int_out.xs[i, 0, 0], int_out.xs[i, 0, 1], color='red')
+    
+    # rollout trajectories in E(x) space
     for ax in (ax1, ax2):
-        for i in range(int_out.xs.shape[0]):
-            ax.plot(int_out.xs[i, :, 0], int_out.xs[i, :, 1])
-            ax.scatter(int_out.xs[i, 0, 0], int_out.xs[i, 0, 1], color='red')
+        for i in range(max_traj_num):
+            ax.plot(aux_out.ys[i, :, 0], aux_out.zs[i, :, 0])
+            ax.scatter(aux_out.ys[i, 0, 0], aux_out.zs[i, 0, 0], color='red')
             
     # streamplot
     N = 100
@@ -142,7 +152,7 @@ def make_traj_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM,
     ax5.set_xlabel('t')
     ax5.grid(True, alpha=0.3)
 
-    for i in range(aux_out.xs.shape[0]):
+    for i in range(max_traj_num):
         ax4.plot(aux_out.ts[:-1], aux_out.es[i])
         ax5.plot(aux_out.ts[:-1], aux_out.lyaps[i])
 
