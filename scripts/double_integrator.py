@@ -6,8 +6,8 @@ import jax.numpy as jnp
 import diffrax as dfx
 from typing import Callable
 from jax import vmap
+from dataclasses import fields
 from einops import rearrange
-from pprint import pprint
 
 @flax_dataclass
 class CfgRollout:
@@ -25,12 +25,7 @@ class CfgROM:
 
     @property
     def attrs(self):
-        return ("dim_x", "dim_y", "dim_z", "dim_u",
-                "kpsi",  # hand-picked linear zd policy gain
-                "ke",    # hand-picked zd manifold error gain
-                "kv",    # hand-picked lyapunov scale
-                "lamv"   # hand-picked lyapunov exponentiality
-        )
+        return tuple(f.name for f in fields(self) if f.name not in ('rngs'))
 
 @flax_dataclass
 class CfgDIROM(CfgROM):
@@ -56,57 +51,32 @@ class CfgLoss: # scales to apply to each loss term
     
     @property
     def attrs(self):
-        return ("autoencoder", "y_proj", "z_proj", 
-                "stable_m", "invari_m", "nondegenerate_enc")
+        return tuple(f.name for f in fields(self) if f.name not in ('supervised'))
 
 
-class DoubleIntegratorROM():
+class BaseROM():
     
-    def __init__(self, cfg_rom: CfgDIROM):
+    def __init__(self, cfg_rom: CfgROM):
         self.cfg_rom = cfg_rom
     
-    '''
-    Note: Input to any of the following functions should not be batched.
-          Batched-application should be done explictly using vmap.
-    '''
-
-    def encode(self, x: jnp.ndarray) -> tuple[float, float]:
-        '''
-        Input: (2,). Should not be batched.
-        Output: Tuple[(1,), (1,)]
-        '''
-        y = x[..., 1:2]
-        z = x[..., 0:1]
-        return y, z
-
-    def decode(self, y: float | jnp.ndarray, z: float | jnp.ndarray) -> jnp.ndarray:
-        return jnp.hstack([z, y])
-
-    def dyn_x(self, x: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
-        x1dot = x[..., 1:2]
-        x2dot = jnp.atleast_1d(u)
-        return jnp.hstack([x1dot, x2dot])
-
-    def dyn_y(self, y:jnp.array, u:jnp.array) -> jnp.array:
-        ydot = jnp.atleast_1d(u)
-        return ydot
-
-    def dyn_z(self, y:jnp.array, z:jnp.array) -> jnp.array:
-        zdot = jnp.atleast_1d(y)
-        return zdot
     
-    def policy_v(self, y: jnp.ndarray, z: jnp.ndarray) -> jnp.array:
-        v = -self.cfg_rom.kpsi * y - self.cfg_rom.ke * (y + self.cfg_rom.kpsi*z)
-        return v
-
-    def policy_psi(self, z: jnp.ndarray) -> jnp.array:
-        return -self.cfg_rom.kpsi * z
+    def encode(self, x): raise NotImplementedError
     
-    def map_v_to_u(self, v: jnp.ndarray) -> jnp.array:
-        return v
+    def decode(self, y, z): raise NotImplementedError
     
-    def lyap(self, z: jnp.array) -> float:
-        return 0.5 * self.cfg_rom.kv * (z ** 2).squeeze()
+    def dyn_x(self, x, u): raise NotImplementedError
+    
+    def dyn_y(self, y, u): raise NotImplementedError
+    
+    def dyn_z(self, y, z): raise NotImplementedError
+    
+    def policy_v(self, y, z): raise NotImplementedError
+    
+    def policy_psi(self, z): raise NotImplementedError
+    
+    def map_v_to_u(self, v): raise NotImplementedError
+    
+    def lyap(self, z): raise NotImplementedError
     
     
     # helpers for loss functions
@@ -120,11 +90,11 @@ class DoubleIntegratorROM():
 
     def _jac_y(self, x: jnp.ndarray) -> jnp.ndarray:
         J = jax.jacfwd(self._encode_vec)(x)  # (2,2)
-        return J[0:1, :]                     # (1,2)
+        return J[:self.cfg_rom.dim_y, :]     # (1,2)
 
     def _jac_z(self, x: jnp.ndarray) -> jnp.ndarray:
         J = jax.jacfwd(self._encode_vec)(x)
-        return J[1:2, :]                   
+        return J[self.cfg_rom.dim_y:, :]                   
 
     def _split_f_g(self, y: jnp.ndarray):
         '''
@@ -208,7 +178,7 @@ class DoubleIntegratorROM():
         Jpsi = jax.jacfwd(self.policy_psi)(z)
         omega = self.dyn_z(_y, z)
 
-        term1  = self.dyn_y(y, v)
+        term1  = self.dyn_y(_y, v)
         term2 = (Jpsi @ omega)
         return self._sqnorm(term1 - term2)
 
@@ -222,7 +192,7 @@ class DoubleIntegratorROM():
         Encourage J_E(x) ∈ SL(n) approximately: det→1, orthonormal columns, det>0.
         Returns shape (1,).
         '''
-        J = self._jac_encoder(x)
+        J = self._jac_encoder(x)  # WARNING: Expects square J
         n = J.shape[0]
         detJ = jnp.linalg.det(J)
         I = jnp.eye(n, dtype=J.dtype)
@@ -233,7 +203,101 @@ class DoubleIntegratorROM():
         return (alpha_det * term_det + beta_orth * term_orth + gamma_pos * term_pos)[None]
 
 
-class NNDoubleIntegratorROM(DoubleIntegratorROM, nnx.Module):
+class BaseNNROM(BaseROM, nnx.Module):
+    
+    def __init__(self, cfg_rom: CfgROM, rngs: nnx.Rngs=nnx.Rngs(0)):
+        super().__init__(cfg_rom)
+        
+        self.nn_encoder = None
+        self.nn_decoder = None
+        self.nn_fy      = None
+        self.nn_gy      = None
+        self.nn_fz      = None
+        self.nn_psi     = None
+
+
+    @property
+    def default_nn_params(self) -> dict: raise NotImplementedError
+
+    def get_nn_params(self) -> dict:
+        out = {}
+        for name in ("nn_encoder", "nn_decoder", "nn_fy", "nn_gy", "nn_fz", "nn_psi"):
+            mod = getattr(self, name)
+            d = {}
+            if hasattr(mod, "kernel"):
+                d["kernel"] = mod.kernel.value
+            if hasattr(mod, "bias"):
+                d["bias"] = mod.bias.value
+            out[name] = d
+        return out
+
+    def set_nn_params(self, params: dict=None):
+        if params is None:
+            params = self.default_nn_params
+        
+        for name, pd in params.items():
+            mod = getattr(self, name)
+            for attr, arr in pd.items():
+                
+                val = getattr(mod, attr).value
+                if val is None: continue
+                
+                arr = jnp.asarray(arr, dtype=val.dtype)
+                if arr.shape != val.shape:
+                    raise ValueError(f"Shape mismatch for {name}.{attr}: {arr.shape} vs {val.shape}")
+                getattr(mod, attr).value = arr
+
+
+class DoubleIntegratorROM(BaseROM):
+    
+    def __init__(self, cfg_rom: CfgDIROM):
+        super().__init__(cfg_rom)
+    
+    '''
+    Note: Input to any of the following functions should not be batched.
+          Batched-application should be done explictly using vmap.
+    '''
+
+    def encode(self, x: jnp.ndarray) -> tuple[float, float]:
+        '''
+        Input: (2,). Should not be batched.
+        Output: Tuple[(1,), (1,)]
+        '''
+        y = x[..., 1:2]
+        z = x[..., 0:1]
+        return y, z
+
+    def decode(self, y: float | jnp.ndarray, z: float | jnp.ndarray) -> jnp.ndarray:
+        return jnp.hstack([z, y])
+
+    def dyn_x(self, x: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
+        x1dot = x[..., 1:2]
+        x2dot = jnp.atleast_1d(u)
+        return jnp.hstack([x1dot, x2dot])
+
+    def dyn_y(self, y:jnp.array, u:jnp.array) -> jnp.array:
+        ydot = jnp.atleast_1d(u)
+        return ydot
+
+    def dyn_z(self, y:jnp.array, z:jnp.array) -> jnp.array:
+        zdot = jnp.atleast_1d(y)
+        return zdot
+    
+    def policy_v(self, y: jnp.ndarray, z: jnp.ndarray) -> jnp.array:
+        v = -self.cfg_rom.kpsi * y - self.cfg_rom.ke * (y + self.cfg_rom.kpsi*z)
+        return v
+
+    def policy_psi(self, z: jnp.ndarray) -> jnp.array:
+        return -self.cfg_rom.kpsi * z
+    
+    def map_v_to_u(self, v: jnp.ndarray) -> jnp.array:
+        return v
+    
+    def lyap(self, z: jnp.array) -> float:
+        return 0.5 * self.cfg_rom.kv * (z ** 2).squeeze()
+    
+
+class NNDoubleIntegratorROM(DoubleIntegratorROM, BaseNNROM):
 
     def __init__(self, cfg_rom: CfgDIROM, rngs: nnx.Rngs=nnx.Rngs(0)):
         super().__init__(cfg_rom)
@@ -256,35 +320,6 @@ class NNDoubleIntegratorROM(DoubleIntegratorROM, nnx.Module):
             "nn_fz":      {"kernel": jnp.array([[1.], [0.]])},                # ż = y
             "nn_psi":     {"kernel": jnp.array([[kpsi]])},                    # ψ(z) = kψ z (we negate outside)
         }
-        
-    def get_nn_params(self) -> dict:
-        out = {}
-        for name in ("nn_encoder", "nn_decoder", "nn_fy", "nn_gy", "nn_fz", "nn_psi"):
-            mod = getattr(self, name)
-            d = {}
-            if hasattr(mod, "kernel"):
-                d["kernel"] = mod.kernel.value
-            if hasattr(mod, "bias"):
-                d["bias"] = mod.bias.value
-            out[name] = d
-        return out
-    
-    def set_nn_params(self, params: dict=None):
-        if params is None:
-            params = self.default_nn_params
-        
-        for name, pd in params.items():
-            mod = getattr(self, name)
-            for attr, arr in pd.items():
-                
-                val = getattr(mod, attr).value
-                if val is None: continue
-                
-                arr = jnp.asarray(arr, dtype=val.dtype)
-                if arr.shape != val.shape:
-                    raise ValueError(f"Shape mismatch for {name}.{attr}: {arr.shape} vs {val.shape}")
-                getattr(mod, attr).value = arr
-    
 
     def encode(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         yz = self.nn_encoder(x)
@@ -308,9 +343,9 @@ class NNDoubleIntegratorROM(DoubleIntegratorROM, nnx.Module):
 
     def policy_v(self, y: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
         y = jnp.atleast_1d(y)
-        z = jnp.atleast_1d(z)
-        gy   = self.nn_gy(y)
-        ginv = 1.0 / (gy + 1e-6)
+        z = jnp.atleast_1d(z) 
+        gy   = self.nn_gy(y) # TODO: Consider softplus(gy) + 1e-2
+        ginv = 1.0 / (gy + 1e-6) 
         zdot = self.dyn_z(y, z)
         _, dpsi_omega = jax.jvp(self.policy_psi, (z,), (zdot,))
         fy = self.nn_fy(y)
@@ -474,4 +509,3 @@ class Integrator(PyTreeNode):
         return LossOutput(**loss_dict)
             
     
-        
