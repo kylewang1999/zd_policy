@@ -83,10 +83,10 @@ def make_traj_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM,
     ax1.set_ylim(-box_width, box_width)
     ax2.set_xlim(-box_width/5, box_width/5)
     ax2.set_ylim(-box_width/5, box_width/5)
-    ax1.set_title('(z1,z2) trajectories')
-    ax2.set_title('(z1,z2) trajectories (zoomed)')
+    ax1.set_title('(z,y) trajectories')
+    ax2.set_title('(z,y) trajectories (zoomed)')
     ax3.set_title('(x1,x2) trajectories')
-    for ax in (ax1, ax2, ax3):
+    for ax in (ax1, ax2):
         ax.set_xlabel('x1')
         ax.set_ylabel('x2')
         ax.grid(True, alpha=0.3)
@@ -107,8 +107,8 @@ def make_traj_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM,
         zetas = jnp.stack([ys, zs], axis=-1)
         # xs_backproj = E_inv.T @ zetas
         # x1s, x2s = xs_backproj[:, 0], xs_backproj[:, 1]
-        for ax in (ax1, ax2, ax3):
-            ax.plot(ys, zs, 'k--', linewidth=2, label='Zero dynamics line')
+        for ax in (ax1, ax2):
+            ax.plot(ys, zs, 'k--', linewidth=2, label=r'$y=\psi(z)$')
             # ax.plot(x1s, x2s, 'k--', linewidth=2, label='Zero dynamics line')
 
     # rollout trajectories in x space

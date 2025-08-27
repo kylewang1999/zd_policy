@@ -310,7 +310,7 @@ class NNDoubleIntegratorROM(DoubleIntegratorROM, nnx.Module):
         y = jnp.atleast_1d(y)
         z = jnp.atleast_1d(z)
         gy   = self.nn_gy(y)
-        ginv = 1.0 / (gy + 1e-8)
+        ginv = 1.0 / (gy + 1e-6)
         zdot = self.dyn_z(y, z)
         _, dpsi_omega = jax.jvp(self.policy_psi, (z,), (zdot,))
         fy = self.nn_fy(y)
