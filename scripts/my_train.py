@@ -6,6 +6,9 @@ from jax import random
 from tqdm import tqdm
 import flax.nnx as nnx
 import matplotlib.pyplot as plt
+import numpy as np
+from functools import wraps
+from pprint import pprint
 
 from flax.struct import dataclass as flax_dataclass
 from flax.struct import field, PyTreeNode
@@ -17,6 +20,25 @@ sys.path.append(osp.dirname(osp.dirname(osp.abspath(__file__))))
 from double_integrator import *
 
 
+def catch_keyboard_interrupt(message: str = "Training interrupted by user"):
+    """
+    Decorator to handle KeyboardInterrupt gracefully in training functions.
+    
+    Args:
+        message: Custom message to print when interrupted
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except KeyboardInterrupt:
+                print(message)
+                return None
+        return wrapper
+    return decorator
+
+
 @flax_dataclass
 class CfgData:
     box_width: float = 2.0  # box width for x0s
@@ -26,14 +48,14 @@ class CfgData:
 
 @flax_dataclass
 class CfgTrain:
-    num_epochs: int = 20
+    num_epochs: int = 10
     num_batches: int = 5
     num_logs: int = 10
     lr: float = 5e-2
     enable_lr_schedule: bool = False
 
 
-def corrupt_params(rom: DoubleIntegratorROM | NNDoubleIntegratorROM, 
+def corrupt_params(rom: NNDoubleIntegratorROM, 
                    rng: jax.random.PRNGKey,
                    corruption_factor: float = 1.0):
     params = rom.get_nn_params()
@@ -48,13 +70,12 @@ def corrupt_params(rom: DoubleIntegratorROM | NNDoubleIntegratorROM,
     rom.set_nn_params(corrupted_params)
 
 
-def make_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM, 
-               ret: IntegratorOutput, 
-               aux_ret: IntegratorAuxOutput, 
-               loss_ret: LossOutput, 
-               box_width: float = 2.0):
+def make_traj_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM, 
+                    int_out: IntegratorOutput, 
+                    aux_out: IntegratorAuxOutput, 
+                    box_width: float = 2.0):
     
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+    fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(1, 5, figsize=(25, 5))
     ax1.set_xlim(-box_width, box_width)
     ax1.set_ylim(-box_width, box_width)
     ax2.set_xlim(-box_width/5, box_width/5)
@@ -67,17 +88,30 @@ def make_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM,
         ax.grid(True, alpha=0.3)
 
     # zero dynamics line
-    x1s = jnp.linspace(-box_width, box_width, 100).reshape(-1,1)
-    psi_slope = jax.vmap(jax.grad(lambda x: rom.policy_psi(x).squeeze()))(x1s).squeeze()
-    x2s = psi_slope * x1s
-    for ax in (ax1, ax2, ax3):
-        ax.plot(x1s, x2s, 'k--', linewidth=2, label='Zero dynamics line')
+    if not isinstance(rom, NNDoubleIntegratorROM):
+        x1s = jnp.linspace(-box_width, box_width, 100).reshape(-1,1)
+        psi_slope = jax.vmap(jax.grad(lambda x: rom.policy_psi(x).squeeze()))(x1s).squeeze()
+        x2s = psi_slope * x1s
+        for ax in (ax1, ax2, ax3):
+            ax.plot(x1s, x2s, 'k--', linewidth=2, label='Zero dynamics line')
+            
+    else:
+        zs = jnp.linspace(-box_width, box_width, 100).reshape(-1,1)
+        ys = jax.vmap(rom.policy_psi, in_axes=(0,))(zs)
+        E = rom.get_nn_params()["nn_encoder"]["kernel"]
+        E_inv = jnp.linalg.inv(E.T)
+        zetas = jnp.stack([ys, zs], axis=-1)
+        # xs_backproj = E_inv.T @ zetas
+        # x1s, x2s = xs_backproj[:, 0], xs_backproj[:, 1]
+        for ax in (ax1, ax2, ax3):
+            ax.plot(ys, zs, 'k--', linewidth=2, label='Zero dynamics line')
+            # ax.plot(x1s, x2s, 'k--', linewidth=2, label='Zero dynamics line')
 
     # rollout trajectories
     for ax in (ax1, ax2):
-        for i in range(ret.xs.shape[0]):
-            ax.plot(ret.xs[i, :, 0], ret.xs[i, :, 1])
-            ax.scatter(ret.xs[i, 0, 0], ret.xs[i, 0, 1], color='red')
+        for i in range(int_out.xs.shape[0]):
+            ax.plot(int_out.xs[i, :, 0], int_out.xs[i, :, 1])
+            ax.scatter(int_out.xs[i, 0, 0], int_out.xs[i, 0, 1], color='red')
             
     # streamplot
     N = 100
@@ -99,39 +133,45 @@ def make_plots(rom: DoubleIntegratorROM | NNDoubleIntegratorROM,
     
     X1n, X2n, Un, Vn = map(np.asarray, (X1, X2, DX1, DX2))
     ax3.streamplot(X1n, X2n, Un, Vn, density=1.2, linewidth=0.8, arrowsize=1.2, minlength=0.2)
-            
-    plt.show()
 
     # M_\psi error
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    ax1.set_title(r'||y(t) - \psi(z(t))||')
-    ax1.set_xlabel('t')
-    ax1.grid(True, alpha=0.3)
-    ax2.set_title(r'V_z(z(t))')
-    ax2.set_xlabel('t')
-    ax2.grid(True, alpha=0.3)
+    ax4.set_title(r'||y(t) - \psi(z(t))||')
+    ax4.set_xlabel('t')
+    ax4.grid(True, alpha=0.3)
+    ax5.set_title(r'V_z(z(t))')
+    ax5.set_xlabel('t')
+    ax5.grid(True, alpha=0.3)
 
-    for i in range(aux_ret.xs.shape[0]):
-        ax1.plot(aux_ret.ts[:-1], aux_ret.es[i])
-        ax2.plot(aux_ret.ts[:-1], aux_ret.lyaps[i])
-        
-    # loss components
-    fig, axes = plt.subplots(1, len(loss_ret.attrs), figsize=(4*len(loss_ret.attrs), 3))
-    for ax, attr in zip(axes, loss_ret.attrs):
+    for i in range(aux_out.xs.shape[0]):
+        ax4.plot(aux_out.ts[:-1], aux_out.es[i])
+        ax5.plot(aux_out.ts[:-1], aux_out.lyaps[i])
+
+    plt.show()
+    return fig
+    
+
+def make_loss_plots(aux_out: IntegratorAuxOutput, 
+                    loss_out: LossOutput, 
+                    title: str = "Losses"):
+    
+    fig, axes = plt.subplots(1, len(loss_out.attrs), figsize=(4*len(loss_out.attrs), 5))
+    fig.suptitle(title)
+    for ax, attr in zip(axes, loss_out.attrs):
         ax.set_title(attr)
         ax.set_xlabel('t')
         ax.grid(True, alpha=0.3)
         
-        for i in range(aux_ret.xs.shape[0]):
-            ax.plot(aux_ret.ts[:-1], getattr(loss_ret, attr)[i])
-
+        for i in range(aux_out.xs.shape[0]):
+            ax.plot(aux_out.ts[:-1], getattr(loss_out, attr)[i])
+            
     plt.show()
+    return fig
 
 
 def change_rom_param_type(rom: NNDoubleIntegratorROM, 
                           to_param_type: nnx.Param | nnx.Variable,
                           component_list: list[str] = ["nn_encoder", "nn_decoder", 
-                                                       "nn_fy", "nn_gy", "nn_fz"]):
+                                                       "nn_fy", "nn_gy", "nn_fz", "nn_psi"]):
     """
     Change the type of specified parameters to nnx.Variable instead of nnx.Param.
     This prevents them from being updated during training.
@@ -153,20 +193,21 @@ def change_rom_param_type(rom: NNDoubleIntegratorROM,
                         
 def freeze_parameters(rom: NNDoubleIntegratorROM, 
                       component_list: list[str] = ["nn_encoder", "nn_decoder", 
-                                                   "nn_fy", "nn_gy", "nn_fz"]):
+                                                   "nn_fy", "nn_gy", "nn_fz", "nn_psi"]):
     change_rom_param_type(rom, nnx.Variable, component_list)
     
 
 def unfreeze_parameters(rom: NNDoubleIntegratorROM, 
                         component_list: list[str] = ["nn_encoder", "nn_decoder", 
-                                                     "nn_fy", "nn_gy", "nn_fz"]):
+                                                     "nn_fy", "nn_gy", "nn_fz", "nn_psi"]):
     change_rom_param_type(rom, nnx.Param, component_list)
 
 
-def get_expert_batch(rom: DoubleIntegratorROM, 
-                     integrator: Integrator,
-                     cfg_data: CfgData = CfgData(),
-                     rng: jax.random.PRNGKey = jax.random.PRNGKey(0)):
+def get_batch(rom_expert: DoubleIntegratorROM, 
+              integrator: Integrator,
+              cfg_data: CfgData = CfgData(),
+              rng: jax.random.PRNGKey = jax.random.PRNGKey(0),
+              init_states_only: bool = False):
     
     '''
     Get a batch of expert data for training.
@@ -174,52 +215,34 @@ def get_expert_batch(rom: DoubleIntegratorROM,
     '''
     
     key_x, key_u = jax.random.split(rng, 2)
-    x0s = jax.random.uniform(key_x, (cfg_data.batch_size, rom.cfg_rom.dim_x), 
-                             minval=-cfg_data.box_width, maxval=cfg_data.box_width)
+    dim_x, dim_u = rom_expert.cfg_rom.dim_x, rom_expert.cfg_rom.dim_u
+    batch_size = cfg_data.batch_size
+    box_width = cfg_data.box_width
+    
+    x0s = jax.random.uniform(key_x, (batch_size, dim_x), 
+                             minval=-box_width, maxval=box_width)
+    if init_states_only:
+        return IntegratorOutput(xs=x0s[:, None, :], us=jnp.zeros((batch_size, 1, dim_u)))
+    
     
     n_policy_v = int(cfg_data.batch_size * cfg_data.policy_ratios[0])
-    n_policy_noop = cfg_data.batch_size - n_policy_v
     x0s_policy_v = x0s[:n_policy_v]
     x0s_policy_noop = x0s[n_policy_v:]
 
-    ret_policy_v = integrator.apply(x0s_policy_v, rom)
-    ret_policy_noop = integrator.apply(x0s_policy_noop, rom, lambda y, z: jnp.zeros((rom.cfg_rom.dim_u,)))
+    ret_policy_v = integrator.apply(x0s_policy_v, rom_expert)
+    ret_policy_noop = integrator.apply(x0s_policy_noop, rom_expert, 
+                                       policy_fun=lambda y, z: jnp.zeros((dim_u,)))
     
-    return ret_policy_v, ret_policy_noop
-
-
-def get_batch(rng: jax.random.PRNGKey, 
-              cfg_data: CfgData = CfgData(),
-              cfg_rom: CfgROM = CfgROM()):
-    key_x = rng
-    x0s = jax.random.uniform(key_x, 
-                                (cfg_data.batch_size, cfg_rom.dim_x), 
-                                minval=-cfg_data.box_width, 
-                                maxval=cfg_data.box_width)
-    return x0s
-
-# @nnx.jit(static_argnames=("integrator",))
-# def step(model: NNDoubleIntegratorROM, batch: jnp.ndarray, integrator: Integrator):
     
-#     def loss_fn(_m: NNDoubleIntegratorROM):
-#         int_out  = integrator.apply(batch, rom=_m)           
-#         loss_out = integrator.compute_loss(int_out, rom=_m)
-#         return jnp.mean(loss_out.total), loss_out
-    
-#     return nnx.value_and_grad(loss_fn, has_aux=True)(model)
-
-def make_step_fn(integrator: Integrator):
-    @nnx.jit
-    def step(model: NNDoubleIntegratorROM, batch: jnp.ndarray):
-        def loss_fn(m: NNDoubleIntegratorROM):
-            int_out  = integrator.apply(batch, rom=m)
-            loss_out = integrator.compute_loss(int_out, rom=m)
-            return jnp.mean(loss_out.total), loss_out
-        return nnx.value_and_grad(loss_fn, has_aux=True)(model)
-    return step
+    return IntegratorOutput(
+        xs = jnp.concatenate([ret_policy_v.xs, ret_policy_noop.xs], axis=0),
+        us = jnp.concatenate([ret_policy_v.us, ret_policy_noop.us], axis=0)
+    )
 
 
-def train(rom: NNDoubleIntegratorROM, 
+@catch_keyboard_interrupt("Training interrupted by user")
+def train(rom_nn: NNDoubleIntegratorROM, 
+          rom_expert: DoubleIntegratorROM,
           integrator: Integrator, 
           cfg_train: CfgTrain, 
           cfg_data: CfgData, 
@@ -237,51 +260,103 @@ def train(rom: NNDoubleIntegratorROM,
         tx = optax.adam(lr_schedule)
     else:
         tx = optax.adam(cfg_train.lr)
-    opt = nnx.Optimizer(rom, tx, wrt=nnx.Param)
+    opt = nnx.Optimizer(rom_nn, tx, wrt=nnx.Param)
     rngs = jax.random.split(rng, cfg_train.num_batches)
     
     
     @nnx.jit
-    def step(model: NNDoubleIntegratorROM, batch: jnp.ndarray):
+    def step(model: NNDoubleIntegratorROM, batch: IntegratorOutput):
     
         def loss_fn(_m: NNDoubleIntegratorROM):
-            int_out  = integrator.apply(batch, rom=_m)           
-            loss_out = integrator.compute_loss(int_out, rom=_m, cfg_loss=cfg_loss)
-            return jnp.mean(loss_out.total), loss_out
+            int_out  = integrator.apply(batch.xs[:,0,:], rom=_m)     
+            loss_out = integrator.compute_loss(int_out, batch, rom=_m, cfg_loss=cfg_loss)
+            aux_out = integrator.post_apply(int_out, rom=_m)
+            return jnp.mean(loss_out.total), (int_out, aux_out, loss_out)
         
         return nnx.value_and_grad(loss_fn, has_aux=True)(model)
 
-    
-    try:
+    global_step = 0
+    epoch_losses = []
+    for i in (pbar := tqdm(range(cfg_train.num_epochs))):
         
-        global_step = 0
-        epoch_losses = []
-        for i in (pbar := tqdm(range(cfg_train.num_epochs))):
+        batch_losses = []
+        for b in range(cfg_train.num_batches):
+        
+            batch = get_batch(rom_expert, integrator, cfg_data, rngs[b], 
+                              init_states_only= not cfg_loss.supervised)
+            (loss, (int_out, aux_out, loss_out)), grads = step(rom_nn, batch)
             
-            batch_losses = []
-            for b in range(cfg_train.num_batches):
+            opt.update(grads=grads)
+            batch_losses.append(loss)
+            global_step += 1
             
-                batch = get_batch(rngs[b], cfg_data, rom.cfg_rom)
-                # step_fn = make_step_fn(integrator)
-                (loss, loss_out), grads = step(rom, batch)
-                
-                opt.update(grads=grads)
-                batch_losses.append(loss)
-                global_step += 1
-                
-            epoch_loss = jnp.mean(jnp.array(batch_losses))
-            epoch_losses.append(epoch_loss)
-            lr = lr_schedule(global_step) if cfg_train.enable_lr_schedule else cfg_train.lr
-            pbar.set_postfix({"loss": f"{epoch_loss:.2e}", "lr": f"{lr:.2e}"})
-            
-            if i % (cfg_train.num_epochs // cfg_train.num_logs) == 0:
-                pass
-            
+        epoch_loss = jnp.mean(jnp.array(batch_losses))
+        epoch_losses.append(epoch_loss)
+        lr = lr_schedule(global_step) if cfg_train.enable_lr_schedule else cfg_train.lr
+        pbar.set_postfix({"loss": f"{epoch_loss:.2e}", "lr": f"{lr:.2e}"})
+        
+        if i % (cfg_train.num_epochs // cfg_train.num_logs) == 0:
+            pass
+        
+    print("\nParams after training:")
+    pprint(rom_nn.get_nn_params(), width=120)
     
-    except KeyboardInterrupt:
-        print("Training interrupted by user")
-        return
+    make_traj_plots(rom_nn, int_out, aux_out)
+    make_loss_plots(aux_out, loss_out)
     
-    plt.plot(np.arange(len(epoch_losses)), epoch_losses, label="loss")
-    plt.title("Loss vs Epoch")
+    plt.plot(epoch_losses)
+    plt.title("Losses")
     plt.show()
+    
+    
+    return loss_out # last batch loss
+
+
+if __name__ == "__main__":
+
+    cfg_rollout = CfgRollout()
+    cfg_rom = CfgDIROM()
+    cfg_train = CfgTrain()
+    cfg_data = CfgData()
+
+    ts = jnp.arange(cfg_rollout.t0, cfg_rollout.t1 + cfg_rollout.dt, cfg_rollout.dt)
+    rng = jax.random.PRNGKey(42)
+    rom_nn = NNDoubleIntegratorROM(cfg_rom=cfg_rom)
+    rom_expert = DoubleIntegratorROM(cfg_rom=cfg_rom)
+
+    rom_nn.set_nn_params({
+        "nn_encoder": {"kernel": jnp.array([[0., 1.], [1., 0.]])},
+        "nn_decoder": {"kernel": jnp.array([[0., 1.], [1., 0.]])},
+        "nn_gy":      {"kernel": jnp.array([[0.]]), "bias": jnp.array([1.])},
+        # "nn_fy":      {"kernel": jnp.array([[0.]])},                      
+        # "nn_fz":      {"kernel": jnp.array([[1.], [0.]])},                # ż = y
+        # "nn_psi":      {"kernel": jnp.array([[-0.4]])}, # on purpose give it a incorrect value.
+    })
+
+    print("Before training:")
+    pprint(rom_nn.get_nn_params(), width=120)
+
+    integrator = Integrator(
+        solver=partial(dfx.diffeqsolve, solver=dfx.Tsit5()),
+        ts=ts
+    )
+
+
+    # freeze_parameters(rom_nn, ["nn_encoder", "nn_decoder"])
+    if (train_ae_only:=False):
+        cfg_loss_ae = CfgLoss(autoencoder=1.0, nondegenerate_enc=0.0, supervised=True)
+        train(rom_nn, rom_expert, integrator, cfg_train, cfg_data, cfg_loss_ae, rng)
+
+    if (train_dyn_only:=True):
+        # cfg_loss_dyn = CfgLoss(autoencoder=0.0, y_proj=1.0, z_proj=1.0, nondegenerate_enc=1.0, supervised=True)
+        cfg_loss_dyn = CfgLoss(autoencoder=1.0, y_proj=0.0, z_proj=0.0, nondegenerate_enc=0.0, supervised=True)
+        freeze_parameters(rom_nn, ["nn_encoder", "nn_decoder"])
+        train(rom_nn, rom_expert, integrator, cfg_train, cfg_data, cfg_loss_dyn, rng)
+
+    if (train_zd_policy_only:=False):
+        cfg_loss_zd = CfgLoss(stable_m=1.0, invari_m=1.0, supervised=True)
+        freeze_parameters(rom_nn, ["nn_encoder", "nn_decoder", "nn_fz", "nn_gy", "nn_fy"])
+        train(rom_nn, rom_expert, integrator, cfg_train, cfg_data, cfg_loss_zd, rng)
+        
+    print("After training:")
+    pprint(rom_nn.get_nn_params(), width=120)

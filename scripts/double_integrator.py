@@ -1,15 +1,13 @@
-import numpy as np
-import jax, flax
+import jax
 from flax.struct import dataclass as flax_dataclass
 from flax.struct import field, PyTreeNode
 import flax.nnx as nnx
 import jax.numpy as jnp
 import diffrax as dfx
-import jax_dataclasses as jdc
 from typing import Callable
-from functools import partial
 from jax import vmap
 from einops import rearrange
+from pprint import pprint
 
 @flax_dataclass
 class CfgRollout:
@@ -48,12 +46,13 @@ class CfgDIROM(CfgROM):
     
 @flax_dataclass
 class CfgLoss: # scales to apply to each loss term
-    autoencoder: float = 0.0
-    y_proj: float = 0.0
-    z_proj: float = 0.0
-    stable_m: float = 0.0
-    invari_m: float = 0.0
-    nondegenerate_enc: float = 0.0
+    autoencoder: float = 1.0
+    y_proj: float = 1.0
+    z_proj: float = 1.0
+    stable_m: float = 1.0
+    invari_m: float = 1.0
+    nondegenerate_enc: float = 1.0
+    supervised: bool = False
     
     @property
     def attrs(self):
@@ -154,7 +153,6 @@ class DoubleIntegratorROM():
         '''
         L_y = || Dy(x) f_xu - [ f_y(y) + G_y(y) u ] ||^2  (shape (1,))
         '''
-        y, z = self.encode(x)
         Dy   = self._jac_y(x)
         f_xu = self.dyn_x(x, u)
         term1 = Dy @ f_xu
@@ -169,7 +167,6 @@ class DoubleIntegratorROM():
         '''
         L_ω = || Dz(x) f_xu - ω(y,z) ||^2  (shape (1,))
         '''
-        y, z = self.encode(x)
         Dz   = self._jac_z(x)
         f_xu = self.dyn_x(x, u)
         term1 = Dz @ f_xu
@@ -189,8 +186,8 @@ class DoubleIntegratorROM():
             (1,)
         '''
         lam = self.cfg_rom.lamv
-        y = self.policy_psi(z)
-        omega = self.dyn_z(y, z)                       # (1,)
+        _y = self.policy_psi(z)
+        omega = self.dyn_z(_y, z)                       # (1,)
         V = self.lyap(z)                               # scalar ()
         gradV = jax.grad(self.lyap)(z)                 # (1,)
         stab = jnp.sum(gradV * omega) + lam * V        # scalar ()
@@ -198,19 +195,18 @@ class DoubleIntegratorROM():
         
         # kparam = jnp.squeeze(self.nn_psi.kernel.value)
         # return jax.nn.relu(0.5*self.cfg_rom.lamv - kparam)[None]
-        
-
+    
 
     def loss_invari_m(self, x, u, y, z) -> jnp.ndarray:
         '''
         L_inv = || f(ψ(z),z) + G(ψ(z)) v(ψ(z),z) - (∂ψ/∂z)(z) ω(ψ(z),z) ||^2  (shape (1,))
         Uses per-sample v = policy_v(ψ(z), z), f,G from dyn_y decomposition.
         '''
-        y = self.policy_psi(z)
-        v = jax.lax.stop_gradient(self.policy_v(y, z))
+        _y = self.policy_psi(z)
+        v = jax.lax.stop_gradient(self.policy_v(_y, z))
 
         Jpsi = jax.jacfwd(self.policy_psi)(z)
-        omega = self.dyn_z(y, z)
+        omega = self.dyn_z(_y, z)
 
         term1  = self.dyn_y(y, v)
         term2 = (Jpsi @ omega)
@@ -220,7 +216,7 @@ class DoubleIntegratorROM():
     def loss_nondegenerate_enc(self,x, u, y, z,
                                alpha_det: float = 1.0,   # weight for (det-1)^2
                                beta_orth: float = 1.0,   # weight for ||JᵀJ - I||_F^2
-                               gamma_pos: float = 0.0    # weight to prefer det>0 (orientation)
+                               gamma_pos: float = 0.0    # weight to prefer det>0 or det<0
     ) -> jnp.ndarray:
         '''
         Encourage J_E(x) ∈ SL(n) approximately: det→1, orthonormal columns, det>0.
@@ -290,7 +286,6 @@ class NNDoubleIntegratorROM(DoubleIntegratorROM, nnx.Module):
                 getattr(mod, attr).value = arr
     
 
-
     def encode(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         yz = self.nn_encoder(x)
         y, z = yz[0:1], yz[1:2]
@@ -320,16 +315,19 @@ class NNDoubleIntegratorROM(DoubleIntegratorROM, nnx.Module):
         _, dpsi_omega = jax.jvp(self.policy_psi, (z,), (zdot,))
         fy = self.nn_fy(y)
         return ginv * (dpsi_omega - self.cfg_rom.ke * (y - self.policy_psi(z)) - fy)
+        # return super().policy_v(y, z)
 
     def lyap(self, z: jnp.ndarray) -> jnp.ndarray:
         return super().lyap(z)
-
 
 
 @flax_dataclass
 class IntegratorOutput:
     xs: jnp.ndarray
     us: jnp.ndarray
+    
+    @property
+    def attrs(self): return ("xs", "us")
     
     
 @flax_dataclass
@@ -371,7 +369,7 @@ class Integrator(PyTreeNode):
     def n_steps(self) -> int: return len(self.ts) - 1
 
 
-    def apply(self, x0s, rom: DoubleIntegratorROM, policy_fun: Callable=None):
+    def apply(self, x0s, rom: DoubleIntegratorROM, policy_fun: Callable=None) -> IntegratorOutput:
         ''' Integrate the dynamics from self.ts[0] to self.ts[-1] with initial condition x0s.
         Input:
             x0s: (B, 2)
@@ -438,23 +436,42 @@ class Integrator(PyTreeNode):
     
     def compute_loss(self, 
                      int_out: IntegratorOutput, 
+                     int_out_expert: IntegratorOutput,
                      rom: DoubleIntegratorROM,
                      cfg_loss: CfgLoss = CfgLoss()) -> LossOutput:
-        xs, us = int_out.xs, int_out.us
+        
+        xs, us = int_out.xs, int_out.us # (B,T+1,2), (B,T,1)
         B, T = us.shape[:2]
         xs_t = xs[:, :-1, :]
         flat_xs = rearrange(xs_t, 'b t d -> (b t) d')
         flat_us = rearrange(us,   'b t d -> (b t) d')
         flat_ys, flat_zs = vmap(rom.encode)(flat_xs)
         
+        xs_expert, us_expert = int_out_expert.xs, int_out_expert.us # (B,T+1,2), (B,T,1)
+        xs_expert_t = xs_expert[:, :-1, :]
+        flat_xs_expert = rearrange(xs_expert_t, 'b t d -> (b t) d')
+        flat_us_expert = rearrange(us_expert,   'b t d -> (b t) d')
+        flat_ys_expert, flat_zs_expert = vmap(rom.encode)(flat_xs_expert)
+        
+        if not cfg_loss.supervised:
+            loss_inputs = (flat_xs, flat_us, flat_ys, flat_zs)
+        else:
+            loss_inputs = (flat_xs_expert, flat_us_expert, flat_ys_expert, flat_zs_expert)
+
         loss_dict = {}
         for attr in cfg_loss.attrs:
             loss_fn = getattr(rom, f"loss_{attr}")
             loss_scale = getattr(cfg_loss, attr)
-            loss_term = vmap(loss_fn, in_axes=(0,0,0,0))(flat_xs, flat_us, flat_ys, flat_zs)
-            loss_term = rearrange(loss_term, '(b t) d -> b t d', b=B)
-            loss_dict[attr] = loss_term * loss_scale
+            if loss_scale == 0.0: 
+                loss_dict[attr] = jnp.zeros((B, T, 1))
+            else:
+                loss_term = vmap(loss_fn, in_axes=(0,0,0,0))(*loss_inputs)
+                loss_term = rearrange(loss_term, '(b t) d -> b t d', b=B)
+                loss_dict[attr] = loss_term * loss_scale
         
         loss_dict["total"] = jnp.sum(jnp.stack(list(loss_dict.values())), axis=0)
 
         return LossOutput(**loss_dict)
+            
+    
+        
